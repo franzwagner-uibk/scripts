@@ -925,6 +925,110 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
     _dump_yaml(project_dir / f"{PROJECT_NAME}.yml", project)
 
 
+def _write_maps_yaml(example_dir: Path) -> None:
+    maps = {
+        "maps": {
+            "north_tyrol_setup_overview": {
+                "title": "North Tyrol setup overview",
+                "output_name": "north_tyrol_setup_overview",
+                "layout": {"nrows": 2, "ncols": 3},
+                "defaults": {"show_scalebar": True},
+                "panels": [
+                    {
+                        "row": 0,
+                        "col": 0,
+                        "kind": "overview",
+                        "title": "overview",
+                        "scale": 2_500_000,
+                        "roi_label": "North Tyrol",
+                    },
+                    {
+                        "row": 0,
+                        "col": 1,
+                        "kind": "roi",
+                        "title": "ROI and stations",
+                        "show_station_marker": True,
+                        "show_stations_name": False,
+                        "show_stations_elev": False,
+                        "below_items": [{"kind": "station_symbol", "label": "Meteo and snow stations"}],
+                    },
+                    {"row": 0, "col": 2, "kind": "dem", "title": "elevation"},
+                    {"row": 1, "col": 0, "kind": "landcover", "title": "land cover"},
+                    {
+                        "row": 1,
+                        "col": 1,
+                        "kind": "hillshade",
+                        "title": "terrain shading",
+                        "show_station_marker": True,
+                        "show_stations_name": False,
+                    },
+                    {
+                        "row": 1,
+                        "col": 2,
+                        "kind": "srf",
+                        "title": "snow redistribution factor",
+                        "show_hillshade": True,
+                    },
+                ],
+            },
+            "early_season_snow_depth_response": _model_map_recipe(
+                title="Early-season snow-depth response",
+                output_name="early_season_snow_depth_response",
+                figure_title="North Tyrol snow depth response - 2022-11-12",
+                date_text="2022-11-12",
+                panel_kind="snow_depth",
+            ),
+            "midwinter_swe_state": _model_map_recipe(
+                title="Midwinter SWE state",
+                output_name="midwinter_swe_state",
+                figure_title="North Tyrol SWE state - 2023-01-06",
+                date_text="2023-01-06",
+                panel_kind="swe",
+            ),
+            "spring_snow_depth_response": _model_map_recipe(
+                title="Spring snow-depth response",
+                output_name="spring_snow_depth_response",
+                figure_title="North Tyrol snow depth response - 2023-03-22",
+                date_text="2023-03-22",
+                panel_kind="snow_depth",
+            ),
+        }
+    }
+    _dump_yaml(example_dir / "projects" / PROJECT_NAME / "maps.yml", maps)
+
+
+def _model_map_recipe(
+    *,
+    title: str,
+    output_name: str,
+    figure_title: str,
+    date_text: str,
+    panel_kind: str,
+) -> dict:
+    return {
+        "title": title,
+        "output_name": output_name,
+        "figure_title": figure_title,
+        "layout": {"nrows": 1, "ncols": 3},
+        "defaults": {
+            "date": date_text,
+            "show_scalebar": True,
+            "show_hillshade": True,
+        },
+        "panels": [
+            {"row": 0, "col": 0, "kind": panel_kind, "source": "open_loop", "title": "open loop"},
+            {"row": 0, "col": 1, "kind": panel_kind, "source": "ensemble_mean", "title": "ensemble mean"},
+            {
+                "row": 0,
+                "col": 2,
+                "kind": panel_kind,
+                "source": "increment",
+                "title": "ensemble mean - open loop",
+            },
+        ],
+    }
+
+
 def _write_readme(example_dir: Path, station_count: int, forcing_count: int, scf_events: list[ScfCandidate]) -> None:
     text = f"""# North Tyrol Subdomain Example
 
@@ -936,6 +1040,7 @@ This shipped example covers the North Tyrol test site as 8 avalanche-report subd
 - Forcing: {forcing_count} `openamundsen-v2` stations within the ROI plus {int(FORCING_BUFFER_M / 1000)} km buffer, trimmed to the project window.
 - Station snow depth: {station_count} ROI stations in `obs/stations`, with `use_for_da` and `use_for_benchmark` role flags.
 - FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; selected per subdomain with at most {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
+- Maps: `projects/{PROJECT_NAME}/maps.yml` adds a setup overview plus focused snow-depth/SWE response maps on selected DA dates. Generated DA-event maps are still rendered automatically from the configured assimilation events.
 
 Run the example with:
 
@@ -1032,6 +1137,7 @@ def build(*, no_archive: bool = False) -> None:
     _write_scf_files(EXAMPLE_DIR, scf_events, roi_geom)
     _write_setup_yaml(EXAMPLE_DIR, stations)
     _write_project_yaml(EXAMPLE_DIR, station_events, scf_events)
+    _write_maps_yaml(EXAMPLE_DIR)
     _write_readme(EXAMPLE_DIR, station_count=len(stations), forcing_count=len(forcing), scf_events=scf_events)
     _write_manifest(
         EXAMPLE_DIR,
