@@ -827,11 +827,6 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                     "nodata": _flow([]),
                 },
             },
-            "wetsnow": {
-                "dir": "obs/wetsnow",
-                "product_tag": "WETSNOW",
-                "classes": {"wet": _flow([110]), "valid": _flow([110, 125, 200, 210]), "exclude": _flow([200, 210])},
-            },
         },
         "data_assimilation": {
             "prior_forcing": {
@@ -930,7 +925,7 @@ def _write_maps_yaml(example_dir: Path) -> None:
         "maps": {
             "north_tyrol_setup_overview": {
                 "title": "North Tyrol setup overview",
-                "output_name": "north_tyrol_setup_overview",
+                "output_name": "setup_overview",
                 "layout": {"nrows": 2, "ncols": 3},
                 "defaults": {"show_scalebar": True},
                 "panels": [
