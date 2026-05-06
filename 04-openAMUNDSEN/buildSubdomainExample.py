@@ -61,9 +61,28 @@ STATION_EVENT_CANDIDATES = [
     date(2022, 12, 7),
     date(2023, 1, 1),
     date(2023, 1, 31),
+    date(2023, 2, 10),
     date(2023, 2, 21),
+    date(2023, 3, 3),
     date(2023, 3, 17),
+    date(2023, 4, 20),
+]
+FSC_EVENT_CANDIDATES = [
+    date(2022, 10, 5),
+    date(2022, 10, 28),
+    date(2022, 11, 12),
+    date(2022, 11, 27),
+    date(2022, 12, 17),
+    date(2022, 12, 29),
+    date(2023, 1, 6),
+    date(2023, 2, 15),
+    date(2023, 3, 7),
+    date(2023, 3, 22),
+    date(2023, 4, 3),
+    date(2023, 4, 6),
     date(2023, 4, 26),
+    date(2023, 5, 26),
+    date(2023, 6, 2),
 ]
 RESOLUTIONS = (50, 100, 250, 500)
 BUILD_RESOLUTIONS = (100, 250, 500, 50)
@@ -73,8 +92,6 @@ GRID_CROP_BUFFER_M = 10_000.0
 SUBDOMAIN_GRID_BUFFER_M = 10_000.0
 FSC_MAX_CLOUD_FRACTION = 0.20
 FSC_SUBDOMAIN_CLOUD_OVERRIDES = {"AT-07-20": 0.25}
-FSC_EVENTS_PER_SUBDOMAIN = 8
-FSC_MIN_SPACING_DAYS = 10
 FSC_CLOUD_CLASSES = (210.0, 215.0)
 
 
@@ -100,6 +117,7 @@ def _dump_yaml(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     yaml = YAML()
     yaml.default_flow_style = False
+    yaml.indent(mapping=2, sequence=4, offset=2)
     yaml.width = 4096
     with path.open("w", encoding="utf-8") as f:
         yaml.dump(data, f)
@@ -650,51 +668,53 @@ def _scf_limit_for_subdomain(subdomain_id: str) -> float:
     return float(FSC_SUBDOMAIN_CLOUD_OVERRIDES.get(subdomain_id, FSC_MAX_CLOUD_FRACTION))
 
 
-def _select_spaced_scf_events(candidates: list[ScfCandidate], subdomain_id: str) -> list[ScfCandidate]:
-    limit = _scf_limit_for_subdomain(subdomain_id)
-    eligible = [
-        cand
-        for cand in sorted(candidates, key=lambda cand: (cand.cloud_by_subdomain[subdomain_id], cand.date))
-        if cand.cloud_by_subdomain[subdomain_id] <= limit
-    ]
-    selected: list[ScfCandidate] = []
-    for cand in eligible:
-        if all(abs((cand.date - existing.date).days) >= FSC_MIN_SPACING_DAYS for existing in selected):
-            selected.append(cand)
-        if len(selected) >= FSC_EVENTS_PER_SUBDOMAIN:
-            break
-    if len(selected) < FSC_EVENTS_PER_SUBDOMAIN:
-        raise ValueError(
-            f"Too few FSC dates for subdomain {subdomain_id} with cloud_fraction <= {limit:.2f}: "
-            f"{len(selected)}"
-        )
-    return sorted(selected, key=lambda cand: cand.date)
-
-
 def _select_scf_events_by_subdomain(
     candidates: list[ScfCandidate],
     subdomains: gpd.GeoDataFrame,
 ) -> list[ScfCandidate]:
-    by_date: dict[date, ScfCandidate] = {}
-    selected_for: dict[date, set[str]] = {}
-    for subdomain_id in subdomains["id"].astype(str):
-        selected = _select_spaced_scf_events(candidates, subdomain_id)
+    by_date = {cand.date: cand for cand in candidates}
+    missing = [dt for dt in FSC_EVENT_CANDIDATES if dt not in by_date]
+    if missing:
+        raise ValueError(f"Configured FSC dates missing from SnowFLAKES source: {[dt.isoformat() for dt in missing]}")
+    overlap = sorted(set(FSC_EVENT_CANDIDATES) & set(STATION_EVENT_CANDIDATES))
+    if overlap:
+        raise ValueError(f"FSC and station DA events must not share dates: {[dt.isoformat() for dt in overlap]}")
+
+    selected: list[ScfCandidate] = []
+    for dt in FSC_EVENT_CANDIDATES:
+        cand = by_date[dt]
+        selected_for = tuple(
+            sorted(
+                subdomain_id
+                for subdomain_id in subdomains["id"].astype(str)
+                if cand.cloud_by_subdomain[subdomain_id] <= _scf_limit_for_subdomain(subdomain_id)
+            )
+        )
+        if not selected_for:
+            raise ValueError(f"Configured FSC date {dt.isoformat()} is too cloudy in every subdomain")
+        selected.append(
+            ScfCandidate(
+                cand.date,
+                cand.zip_name,
+                cand.cloud_by_subdomain,
+                selected_for_subdomains=selected_for,
+            )
+        )
+
+    print("selected project-level FSC events:", flush=True)
+    for cand in selected:
         print(
-            f"selected FSC for {subdomain_id}: "
-            + ", ".join(f"{cand.date.isoformat()} ({cand.cloud_by_subdomain[subdomain_id]:.0%})" for cand in selected),
+            f"  {cand.date.isoformat()}: "
+            + ", ".join(
+                f"{sub_id}={cand.cloud_by_subdomain[sub_id]:.0%}"
+                for sub_id in sorted(cand.cloud_by_subdomain)
+            )
+            + f" (eligible: {', '.join(cand.selected_for_subdomains)})",
             flush=True,
         )
-        for cand in selected:
-            by_date[cand.date] = cand
-            selected_for.setdefault(cand.date, set()).add(subdomain_id)
     return [
-        ScfCandidate(
-            cand.date,
-            cand.zip_name,
-            cand.cloud_by_subdomain,
-            selected_for_subdomains=tuple(sorted(selected_for[cand.date])),
-        )
-        for cand in sorted(by_date.values(), key=lambda cand: cand.date)
+        cand
+        for cand in sorted(selected, key=lambda cand: cand.date)
     ]
 
 
@@ -1021,7 +1041,7 @@ This shipped example covers a larger alpine ROI as 8 avalanche-report subdomains
 - Default resolution: `{DEFAULT_RESOLUTION} m`; available grid resolutions: `{', '.join(map(str, RESOLUTIONS))} m`.
 - Forcing: {forcing_count} `openamundsen-v2` stations within the ROI plus {int(FORCING_BUFFER_M / 1000)} km buffer, trimmed to the project window.
 - Station snow depth: {station_count} ROI stations in `obs/stations`, with `use_for_da` and `use_for_benchmark` role flags.
-- FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; selected per subdomain with at most {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
+- FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; configured as project-level event candidates. The subdomain event filter drops cloudy subdomain/date combinations above {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
 - DA config: 30 ensemble members, ESS threshold ratio 0.7, full output retention, and four-variable forcing/rejuvenation perturbations for temperature, precipitation, humidity, and shortwave radiation.
 - Maps: `projects/{PROJECT_NAME}/maps.yml` adds a setup overview. Generated DA-event maps are rendered automatically from the configured assimilation events.
 
