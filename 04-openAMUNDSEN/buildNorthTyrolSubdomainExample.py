@@ -32,6 +32,8 @@ from shapely.ops import unary_union
 WORKSPACE = Path("/home/franz/workspace")
 OPENAMUNDSEN_DA = WORKSPACE / "repos" / "openamundsen_da"
 FRAMES_DATA = WORKSPACE / "fram3s" / "01-data"
+if not FRAMES_DATA.exists() and (WORKSPACE / "01-data").exists():
+    FRAMES_DATA = WORKSPACE / "01-data"
 EXAMPLE_DIR = OPENAMUNDSEN_DA / "examples" / "subdomains"
 ARCHIVE_ROOT = WORKSPACE / "dev_examples" / "archive"
 
@@ -67,6 +69,8 @@ RESOLUTIONS = (50, 100, 250, 500)
 BUILD_RESOLUTIONS = (100, 250, 500, 50)
 DEFAULT_RESOLUTION = 100
 FORCING_BUFFER_M = 10_000.0
+GRID_CROP_BUFFER_M = 10_000.0
+SUBDOMAIN_GRID_BUFFER_M = 10_000.0
 FSC_MAX_CLOUD_FRACTION = 0.20
 FSC_SUBDOMAIN_CLOUD_OVERRIDES = {"AT-07-20": 0.25}
 FSC_EVENTS_PER_SUBDOMAIN = 8
@@ -119,8 +123,18 @@ def _clean_output(example_dir: Path) -> None:
         (example_dir / name).mkdir(parents=True, exist_ok=True)
 
 
+def _subdomain_roi_source() -> Path | None:
+    roi_source = ROI_PATH if ROI_PATH.is_file() else EXAMPLE_DIR / "env" / "subdomains.gpkg"
+    if not roi_source.is_file():
+        return None
+    return roi_source
+
+
 def _read_subdomains() -> gpd.GeoDataFrame:
-    roi = gpd.read_file(ROI_PATH).to_crs("EPSG:25832")
+    roi_source = _subdomain_roi_source()
+    if roi_source is None:
+        raise FileNotFoundError(f"North Tyrol subdomain ROI source not found: {ROI_PATH}")
+    roi = gpd.read_file(roi_source).to_crs("EPSG:25832")
     roi["geometry"] = roi.geometry.buffer(0)
     if len(roi) != 8:
         raise ValueError(f"Expected 8 North Tyrol subdomains in {ROI_PATH}, got {len(roi)}")
@@ -154,6 +168,8 @@ def _make_non_overlapping(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 def _write_vectors(example_dir: Path, subdomains: gpd.GeoDataFrame) -> BaseGeometry:
     env_dir = example_dir / "env"
+    subdomains = subdomains.copy()
+    subdomains["id"] = subdomains["id"].astype(str).astype(object)
     subdomains.to_file(env_dir / "subdomains.gpkg", driver="GPKG")
     roi_geom = unary_union(list(subdomains.geometry))
     roi_attrs = pd.DataFrame({"id": pd.Series(["north_tyrol"], dtype=object)})
@@ -285,7 +301,7 @@ def _write_neutral_svf(dem_path: Path, dst: Path) -> None:
 
 
 def _write_grids(example_dir: Path, roi_geom: BaseGeometry, resolutions: Iterable[int]) -> dict[int, dict[str, Path]]:
-    bounds = roi_geom.bounds
+    bounds = roi_geom.buffer(GRID_CROP_BUFFER_M).bounds
     out: dict[int, dict[str, Path]] = {}
     for res in resolutions:
         res_paths: dict[str, Path] = {}
@@ -528,9 +544,13 @@ def _scf_zip_entries() -> list[tuple[date, str]]:
 
 
 def _scf_zip_path() -> Path:
-    if SCF_ZIP_CACHE.exists() and SCF_ZIP_CACHE.stat().st_size == SCF_ZIP_SOURCE.stat().st_size:
+    if SCF_ZIP_CACHE.exists() and (
+        not SCF_ZIP_SOURCE.exists() or SCF_ZIP_CACHE.stat().st_size == SCF_ZIP_SOURCE.stat().st_size
+    ):
         print(f"using cached SCF zip {SCF_ZIP_CACHE}", flush=True)
         return SCF_ZIP_CACHE
+    if not SCF_ZIP_SOURCE.exists():
+        raise FileNotFoundError(f"SCF zip source not found and cache is unavailable: {SCF_ZIP_SOURCE}")
     return SCF_ZIP_SOURCE
 
 
@@ -877,7 +897,7 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                     "fallback_uncertainty": 15.0,
                 }
             },
-            "resampling": {"algorithm": "systematic", "ess_threshold_ratio": 0.5, "seed": 42},
+            "resampling": {"algorithm": "systematic", "ess_threshold_ratio": 0.7, "seed": 42},
             "rejuvenation": {
                 "sigma_t": 0.5,
                 "sigma_p": 0.5,
@@ -888,7 +908,7 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
             },
             "restart": {"use_state": True, "dump_state": True, "state_pattern": "model_state.pickle.gz"},
             "output": {
-                "retention": "compact",
+                "retention": "full",
                 "grids": {
                     "format": "netcdf",
                     "compress": True,
@@ -1040,7 +1060,7 @@ This shipped example covers the North Tyrol test site as 8 avalanche-report subd
 Run the example with:
 
 ```bash
-oa-da-subdomain pipeline --setup-dir examples/subdomains --project-dir examples/subdomains/projects/{PROJECT_NAME} --regions examples/subdomains/env/subdomains.gpkg --station-buffer-km 10 --max-workers 8 --inner-max-workers 3 --overwrite
+oa-da-subdomain pipeline --setup-dir examples/subdomains --project-dir examples/subdomains/projects/{PROJECT_NAME} --regions examples/subdomains/env/subdomains.gpkg --station-buffer-km 10 --grid-buffer-m {int(SUBDOMAIN_GRID_BUFFER_M)} --max-workers 8 --inner-max-workers 3 --overwrite
 ```
 
 The FRAMES-specific build logic is external to `openamundsen_da`:
@@ -1074,7 +1094,7 @@ def _write_manifest(
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "archive_path": str(archive_path) if archive_path else None,
         "source_paths": {
-            "roi": str(ROI_PATH),
+            "roi": str(_subdomain_roi_source() or ROI_PATH),
             "raw_subregions": str(RAW_SUBREGIONS_PATH),
             "forcing": str(FORCING_DIR),
             "forcing_meta": str(FORCING_META),
