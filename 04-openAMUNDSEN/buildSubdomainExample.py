@@ -855,8 +855,8 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                 "sigma_t": 0.5,
                 "mu_p": 0.0,
                 "sigma_p": 0.5,
-                "sigma_rh": 0.0,
-                "sigma_sw": 0.0,
+                "sigma_rh": 0.5,
+                "sigma_sw": 0.05,
             },
             "h_of_x": {"method": "depth_threshold", "variable": "hs", "params": {"h0": 0.03, "k": 80}},
             "station": {
@@ -901,8 +901,8 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
             "rejuvenation": {
                 "sigma_t": 0.5,
                 "sigma_p": 0.5,
-                "sigma_rh": 0.0,
-                "sigma_sw": 0.0,
+                "sigma_rh": 0.5,
+                "sigma_sw": 0.05,
                 "seed": 42,
                 "rebase_open_loop": False,
             },
@@ -991,6 +991,26 @@ def _write_maps_yaml(example_dir: Path) -> None:
     _dump_yaml(example_dir / "projects" / PROJECT_NAME / "maps.yml", maps)
 
 
+def _write_plots_yaml(example_dir: Path) -> None:
+    text = """# Custom result overview configuration for subdomain reports.
+#
+# This mirrors the shipped Rofental custom overview intent but omits station
+# panels and wet-snow panels that are not part of the shipped subdomain setup.
+panels:
+  - panel: fSC
+    show_obs: true
+    title: snow cover fraction subdomain ROI - openAMUNDSEN ensemble and satellite data
+
+  - panel: roi-sd
+    title: mean snow depth subdomain ROI - openAMUNDSEN ensemble and open loop
+
+  - panel: ess
+
+  - panel: scores-crpss
+"""
+    (example_dir / "projects" / PROJECT_NAME / "plots.yml").write_text(text, encoding="utf-8")
+
+
 def _write_readme(example_dir: Path, station_count: int, forcing_count: int, scf_events: list[ScfCandidate]) -> None:
     text = f"""# Subdomain Example
 
@@ -1002,6 +1022,7 @@ This shipped example covers a larger alpine ROI as 8 avalanche-report subdomains
 - Forcing: {forcing_count} `openamundsen-v2` stations within the ROI plus {int(FORCING_BUFFER_M / 1000)} km buffer, trimmed to the project window.
 - Station snow depth: {station_count} ROI stations in `obs/stations`, with `use_for_da` and `use_for_benchmark` role flags.
 - FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; selected per subdomain with at most {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
+- DA config: 30 ensemble members, ESS threshold ratio 0.7, full output retention, and four-variable forcing/rejuvenation perturbations for temperature, precipitation, humidity, and shortwave radiation.
 - Maps: `projects/{PROJECT_NAME}/maps.yml` adds a setup overview. Generated DA-event maps are rendered automatically from the configured assimilation events.
 
 Run the example with:
@@ -1100,6 +1121,7 @@ def build(*, no_archive: bool = False) -> None:
     _write_setup_yaml(EXAMPLE_DIR, stations)
     _write_project_yaml(EXAMPLE_DIR, station_events, scf_events)
     _write_maps_yaml(EXAMPLE_DIR)
+    _write_plots_yaml(EXAMPLE_DIR)
     _write_readme(EXAMPLE_DIR, station_count=len(stations), forcing_count=len(forcing), scf_events=scf_events)
     _write_manifest(
         EXAMPLE_DIR,
