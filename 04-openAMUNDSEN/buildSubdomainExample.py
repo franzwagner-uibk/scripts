@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the shipped North Tyrol sub-domain example for openAMUNDSEN-DA.
+"""Build the shipped sub-domain example for openAMUNDSEN-DA.
 
 All FRAMES-specific extraction, clipping, and copy logic intentionally lives in
 this external helper, not in the openamundsen_da package.
@@ -32,6 +32,8 @@ from shapely.ops import unary_union
 WORKSPACE = Path("/home/franz/workspace")
 OPENAMUNDSEN_DA = WORKSPACE / "repos" / "openamundsen_da"
 FRAMES_DATA = WORKSPACE / "fram3s" / "01-data"
+if not FRAMES_DATA.exists() and (WORKSPACE / "01-data").exists():
+    FRAMES_DATA = WORKSPACE / "01-data"
 EXAMPLE_DIR = OPENAMUNDSEN_DA / "examples" / "subdomains"
 ARCHIVE_ROOT = WORKSPACE / "dev_examples" / "archive"
 
@@ -48,7 +50,7 @@ LC_DIR = FRAMES_DATA / "03-landcover" / "lc_eusalp" / "openAMUNDSEN-euregio"
 SRF_DIR = FRAMES_DATA / "06-srf" / "euregio"
 GRID_SOURCE_CACHE = WORKSPACE / ".cache" / "north_tyrol_sources"
 
-DOMAIN = "north_tyrol"
+DOMAIN = "subdomain_example"
 PROJECT_NAME = "project_2022_2023"
 START_DATE = "2022-10-01"
 END_DATE = "2023-06-30 21:00:00"
@@ -59,18 +61,37 @@ STATION_EVENT_CANDIDATES = [
     date(2022, 12, 7),
     date(2023, 1, 1),
     date(2023, 1, 31),
+    date(2023, 2, 10),
     date(2023, 2, 21),
+    date(2023, 3, 3),
     date(2023, 3, 17),
+    date(2023, 4, 20),
+]
+FSC_EVENT_CANDIDATES = [
+    date(2022, 10, 5),
+    date(2022, 10, 28),
+    date(2022, 11, 12),
+    date(2022, 11, 27),
+    date(2022, 12, 17),
+    date(2022, 12, 29),
+    date(2023, 1, 6),
+    date(2023, 2, 15),
+    date(2023, 3, 7),
+    date(2023, 3, 22),
+    date(2023, 4, 3),
+    date(2023, 4, 6),
     date(2023, 4, 26),
+    date(2023, 5, 26),
+    date(2023, 6, 2),
 ]
 RESOLUTIONS = (50, 100, 250, 500)
 BUILD_RESOLUTIONS = (100, 250, 500, 50)
 DEFAULT_RESOLUTION = 100
 FORCING_BUFFER_M = 10_000.0
+GRID_CROP_BUFFER_M = 10_000.0
+SUBDOMAIN_GRID_BUFFER_M = 10_000.0
 FSC_MAX_CLOUD_FRACTION = 0.20
 FSC_SUBDOMAIN_CLOUD_OVERRIDES = {"AT-07-20": 0.25}
-FSC_EVENTS_PER_SUBDOMAIN = 8
-FSC_MIN_SPACING_DAYS = 10
 FSC_CLOUD_CLASSES = (210.0, 215.0)
 
 
@@ -96,6 +117,7 @@ def _dump_yaml(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     yaml = YAML()
     yaml.default_flow_style = False
+    yaml.indent(mapping=2, sequence=4, offset=2)
     yaml.width = 4096
     with path.open("w", encoding="utf-8") as f:
         yaml.dump(data, f)
@@ -119,11 +141,21 @@ def _clean_output(example_dir: Path) -> None:
         (example_dir / name).mkdir(parents=True, exist_ok=True)
 
 
+def _subdomain_roi_source() -> Path | None:
+    roi_source = ROI_PATH if ROI_PATH.is_file() else EXAMPLE_DIR / "env" / "subdomains.gpkg"
+    if not roi_source.is_file():
+        return None
+    return roi_source
+
+
 def _read_subdomains() -> gpd.GeoDataFrame:
-    roi = gpd.read_file(ROI_PATH).to_crs("EPSG:25832")
+    roi_source = _subdomain_roi_source()
+    if roi_source is None:
+        raise FileNotFoundError(f"Subdomain example ROI source not found: {ROI_PATH}")
+    roi = gpd.read_file(roi_source).to_crs("EPSG:25832")
     roi["geometry"] = roi.geometry.buffer(0)
     if len(roi) != 8:
-        raise ValueError(f"Expected 8 North Tyrol subdomains in {ROI_PATH}, got {len(roi)}")
+        raise ValueError(f"Expected 8 subdomains in {ROI_PATH}, got {len(roi)}")
     if "id" not in roi.columns:
         raise ValueError(f"ROI layer missing id column: {ROI_PATH}")
     roi["id"] = roi["id"].astype(str).astype(object)
@@ -154,9 +186,11 @@ def _make_non_overlapping(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 def _write_vectors(example_dir: Path, subdomains: gpd.GeoDataFrame) -> BaseGeometry:
     env_dir = example_dir / "env"
+    subdomains = subdomains.copy()
+    subdomains["id"] = subdomains["id"].astype(str).astype(object)
     subdomains.to_file(env_dir / "subdomains.gpkg", driver="GPKG")
     roi_geom = unary_union(list(subdomains.geometry))
-    roi_attrs = pd.DataFrame({"id": pd.Series(["north_tyrol"], dtype=object)})
+    roi_attrs = pd.DataFrame({"id": pd.Series(["subdomain_example"], dtype=object)})
     gpd.GeoDataFrame(roi_attrs, geometry=[roi_geom], crs=subdomains.crs).to_file(
         env_dir / "roi.gpkg",
         driver="GPKG",
@@ -285,7 +319,7 @@ def _write_neutral_svf(dem_path: Path, dst: Path) -> None:
 
 
 def _write_grids(example_dir: Path, roi_geom: BaseGeometry, resolutions: Iterable[int]) -> dict[int, dict[str, Path]]:
-    bounds = roi_geom.bounds
+    bounds = roi_geom.buffer(GRID_CROP_BUFFER_M).bounds
     out: dict[int, dict[str, Path]] = {}
     for res in resolutions:
         res_paths: dict[str, Path] = {}
@@ -528,9 +562,13 @@ def _scf_zip_entries() -> list[tuple[date, str]]:
 
 
 def _scf_zip_path() -> Path:
-    if SCF_ZIP_CACHE.exists() and SCF_ZIP_CACHE.stat().st_size == SCF_ZIP_SOURCE.stat().st_size:
+    if SCF_ZIP_CACHE.exists() and (
+        not SCF_ZIP_SOURCE.exists() or SCF_ZIP_CACHE.stat().st_size == SCF_ZIP_SOURCE.stat().st_size
+    ):
         print(f"using cached SCF zip {SCF_ZIP_CACHE}", flush=True)
         return SCF_ZIP_CACHE
+    if not SCF_ZIP_SOURCE.exists():
+        raise FileNotFoundError(f"SCF zip source not found and cache is unavailable: {SCF_ZIP_SOURCE}")
     return SCF_ZIP_SOURCE
 
 
@@ -589,7 +627,7 @@ def _scan_scf_candidates(
     print(f"checking SCF candidates: {len(entries)}", flush=True)
     candidates: list[ScfCandidate] = []
     masks: dict[str, np.ndarray] | None = None
-    with tempfile.TemporaryDirectory(prefix="north_tyrol_scf_") as tmp, zipfile.ZipFile(_scf_zip_path()) as zf:
+    with tempfile.TemporaryDirectory(prefix="subdomain_example_scf_") as tmp, zipfile.ZipFile(_scf_zip_path()) as zf:
         temp_dir = Path(tmp)
         checked = 0
         for dt, name in entries:
@@ -630,65 +668,67 @@ def _scf_limit_for_subdomain(subdomain_id: str) -> float:
     return float(FSC_SUBDOMAIN_CLOUD_OVERRIDES.get(subdomain_id, FSC_MAX_CLOUD_FRACTION))
 
 
-def _select_spaced_scf_events(candidates: list[ScfCandidate], subdomain_id: str) -> list[ScfCandidate]:
-    limit = _scf_limit_for_subdomain(subdomain_id)
-    eligible = [
-        cand
-        for cand in sorted(candidates, key=lambda cand: (cand.cloud_by_subdomain[subdomain_id], cand.date))
-        if cand.cloud_by_subdomain[subdomain_id] <= limit
-    ]
-    selected: list[ScfCandidate] = []
-    for cand in eligible:
-        if all(abs((cand.date - existing.date).days) >= FSC_MIN_SPACING_DAYS for existing in selected):
-            selected.append(cand)
-        if len(selected) >= FSC_EVENTS_PER_SUBDOMAIN:
-            break
-    if len(selected) < FSC_EVENTS_PER_SUBDOMAIN:
-        raise ValueError(
-            f"Too few FSC dates for subdomain {subdomain_id} with cloud_fraction <= {limit:.2f}: "
-            f"{len(selected)}"
-        )
-    return sorted(selected, key=lambda cand: cand.date)
-
-
 def _select_scf_events_by_subdomain(
     candidates: list[ScfCandidate],
     subdomains: gpd.GeoDataFrame,
 ) -> list[ScfCandidate]:
-    by_date: dict[date, ScfCandidate] = {}
-    selected_for: dict[date, set[str]] = {}
-    for subdomain_id in subdomains["id"].astype(str):
-        selected = _select_spaced_scf_events(candidates, subdomain_id)
+    by_date = {cand.date: cand for cand in candidates}
+    missing = [dt for dt in FSC_EVENT_CANDIDATES if dt not in by_date]
+    if missing:
+        raise ValueError(f"Configured FSC dates missing from SnowFLAKES source: {[dt.isoformat() for dt in missing]}")
+    overlap = sorted(set(FSC_EVENT_CANDIDATES) & set(STATION_EVENT_CANDIDATES))
+    if overlap:
+        raise ValueError(f"FSC and station DA events must not share dates: {[dt.isoformat() for dt in overlap]}")
+
+    selected: list[ScfCandidate] = []
+    for dt in FSC_EVENT_CANDIDATES:
+        cand = by_date[dt]
+        selected_for = tuple(
+            sorted(
+                subdomain_id
+                for subdomain_id in subdomains["id"].astype(str)
+                if cand.cloud_by_subdomain[subdomain_id] <= _scf_limit_for_subdomain(subdomain_id)
+            )
+        )
+        if not selected_for:
+            raise ValueError(f"Configured FSC date {dt.isoformat()} is too cloudy in every subdomain")
+        selected.append(
+            ScfCandidate(
+                cand.date,
+                cand.zip_name,
+                cand.cloud_by_subdomain,
+                selected_for_subdomains=selected_for,
+            )
+        )
+
+    print("selected project-level FSC events:", flush=True)
+    for cand in selected:
         print(
-            f"selected FSC for {subdomain_id}: "
-            + ", ".join(f"{cand.date.isoformat()} ({cand.cloud_by_subdomain[subdomain_id]:.0%})" for cand in selected),
+            f"  {cand.date.isoformat()}: "
+            + ", ".join(
+                f"{sub_id}={cand.cloud_by_subdomain[sub_id]:.0%}"
+                for sub_id in sorted(cand.cloud_by_subdomain)
+            )
+            + f" (eligible: {', '.join(cand.selected_for_subdomains)})",
             flush=True,
         )
-        for cand in selected:
-            by_date[cand.date] = cand
-            selected_for.setdefault(cand.date, set()).add(subdomain_id)
     return [
-        ScfCandidate(
-            cand.date,
-            cand.zip_name,
-            cand.cloud_by_subdomain,
-            selected_for_subdomains=tuple(sorted(selected_for[cand.date])),
-        )
-        for cand in sorted(by_date.values(), key=lambda cand: cand.date)
+        cand
+        for cand in sorted(selected, key=lambda cand: cand.date)
     ]
 
 
 def _write_scf_files(example_dir: Path, selected: list[ScfCandidate], roi_geom: BaseGeometry) -> None:
     out_dir = example_dir / "obs" / "snowcover"
     out_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="north_tyrol_scf_clip_") as tmp, zipfile.ZipFile(_scf_zip_path()) as zf:
+    with tempfile.TemporaryDirectory(prefix="subdomain_example_scf_clip_") as tmp, zipfile.ZipFile(_scf_zip_path()) as zf:
         temp_dir = Path(tmp)
         for cand in selected:
             extracted = _extract_zip_member(zf, cand.zip_name, temp_dir)
             subset = None
             try:
                 subset = _subset_scf_dataset(extracted, roi_geom.bounds)
-                out = out_dir / f"SnowFLAKES_{cand.date.strftime('%Y%m%d')}_v3_eurac_north_tyrol.nc"
+                out = out_dir / f"SnowFLAKES_{cand.date.strftime('%Y%m%d')}_v3_eurac_subdomain_example.nc"
                 encoding = {
                     "fsc": {"zlib": True, "complevel": 4, "dtype": "float32"},
                     "uncertainty": {"zlib": True, "complevel": 4, "dtype": "float32"},
@@ -827,11 +867,6 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                     "nodata": _flow([]),
                 },
             },
-            "wetsnow": {
-                "dir": "obs/wetsnow",
-                "product_tag": "WETSNOW",
-                "classes": {"wet": _flow([110]), "valid": _flow([110, 125, 200, 210]), "exclude": _flow([200, 210])},
-            },
         },
         "data_assimilation": {
             "prior_forcing": {
@@ -840,8 +875,8 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                 "sigma_t": 0.5,
                 "mu_p": 0.0,
                 "sigma_p": 0.5,
-                "sigma_rh": 0.0,
-                "sigma_sw": 0.0,
+                "sigma_rh": 0.5,
+                "sigma_sw": 0.05,
             },
             "h_of_x": {"method": "depth_threshold", "variable": "hs", "params": {"h0": 0.03, "k": 80}},
             "station": {
@@ -882,18 +917,18 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                     "fallback_uncertainty": 15.0,
                 }
             },
-            "resampling": {"algorithm": "systematic", "ess_threshold_ratio": 0.5, "seed": 42},
+            "resampling": {"algorithm": "systematic", "ess_threshold_ratio": 0.7, "seed": 42},
             "rejuvenation": {
                 "sigma_t": 0.5,
                 "sigma_p": 0.5,
-                "sigma_rh": 0.0,
-                "sigma_sw": 0.0,
+                "sigma_rh": 0.5,
+                "sigma_sw": 0.05,
                 "seed": 42,
                 "rebase_open_loop": False,
             },
             "restart": {"use_state": True, "dump_state": True, "state_pattern": "model_state.pickle.gz"},
             "output": {
-                "retention": "compact",
+                "retention": "full",
                 "grids": {
                     "format": "netcdf",
                     "compress": True,
@@ -928,9 +963,9 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
 def _write_maps_yaml(example_dir: Path) -> None:
     maps = {
         "maps": {
-            "north_tyrol_setup_overview": {
-                "title": "North Tyrol setup overview",
-                "output_name": "north_tyrol_setup_overview",
+            "subdomain_example_setup_overview": {
+                "title": "Subdomain example setup overview",
+                "output_name": "setup_overview",
                 "layout": {"nrows": 2, "ncols": 3},
                 "defaults": {"show_scalebar": True},
                 "panels": [
@@ -940,7 +975,7 @@ def _write_maps_yaml(example_dir: Path) -> None:
                         "kind": "overview",
                         "title": "overview",
                         "scale": 2_500_000,
-                        "roi_label": "North Tyrol",
+                        "roi_label": "Subdomain ROI",
                     },
                     {
                         "row": 0,
@@ -971,85 +1006,53 @@ def _write_maps_yaml(example_dir: Path) -> None:
                     },
                 ],
             },
-            "early_season_snow_depth_response": _model_map_recipe(
-                title="Early-season snow-depth response",
-                output_name="early_season_snow_depth_response",
-                figure_title="North Tyrol snow depth response - 2022-11-12",
-                date_text="2022-11-12",
-                panel_kind="snow_depth",
-            ),
-            "midwinter_swe_state": _model_map_recipe(
-                title="Midwinter SWE state",
-                output_name="midwinter_swe_state",
-                figure_title="North Tyrol SWE state - 2023-01-06",
-                date_text="2023-01-06",
-                panel_kind="swe",
-            ),
-            "spring_snow_depth_response": _model_map_recipe(
-                title="Spring snow-depth response",
-                output_name="spring_snow_depth_response",
-                figure_title="North Tyrol snow depth response - 2023-03-22",
-                date_text="2023-03-22",
-                panel_kind="snow_depth",
-            ),
         }
     }
     _dump_yaml(example_dir / "projects" / PROJECT_NAME / "maps.yml", maps)
 
 
-def _model_map_recipe(
-    *,
-    title: str,
-    output_name: str,
-    figure_title: str,
-    date_text: str,
-    panel_kind: str,
-) -> dict:
-    return {
-        "title": title,
-        "output_name": output_name,
-        "figure_title": figure_title,
-        "layout": {"nrows": 1, "ncols": 3},
-        "defaults": {
-            "date": date_text,
-            "show_scalebar": True,
-            "show_hillshade": True,
-        },
-        "panels": [
-            {"row": 0, "col": 0, "kind": panel_kind, "source": "open_loop", "title": "open loop"},
-            {"row": 0, "col": 1, "kind": panel_kind, "source": "ensemble_mean", "title": "ensemble mean"},
-            {
-                "row": 0,
-                "col": 2,
-                "kind": panel_kind,
-                "source": "increment",
-                "title": "ensemble mean - open loop",
-            },
-        ],
-    }
+def _write_plots_yaml(example_dir: Path) -> None:
+    text = """# Custom result overview configuration for subdomain reports.
+#
+# This mirrors the shipped Rofental custom overview intent but omits station
+# panels and wet-snow panels that are not part of the shipped subdomain setup.
+panels:
+  - panel: fSC
+    show_obs: true
+    title: snow cover fraction subdomain ROI - openAMUNDSEN ensemble and satellite data
+
+  - panel: roi-sd
+    title: mean snow depth subdomain ROI - openAMUNDSEN ensemble and open loop
+
+  - panel: ess
+
+  - panel: scores-crpss
+"""
+    (example_dir / "projects" / PROJECT_NAME / "plots.yml").write_text(text, encoding="utf-8")
 
 
 def _write_readme(example_dir: Path, station_count: int, forcing_count: int, scf_events: list[ScfCandidate]) -> None:
-    text = f"""# North Tyrol Subdomain Example
+    text = f"""# Subdomain Example
 
-This shipped example covers the North Tyrol test site as 8 avalanche-report subdomains.
+This shipped example covers a larger alpine ROI as 8 avalanche-report subdomains.
 
 - Spatial domain: `env/subdomains.gpkg` and `env/roi.gpkg`, EPSG:25832.
 - Temporal domain: `{START_DATE}` to `{END_DATE}`.
 - Default resolution: `{DEFAULT_RESOLUTION} m`; available grid resolutions: `{', '.join(map(str, RESOLUTIONS))} m`.
 - Forcing: {forcing_count} `openamundsen-v2` stations within the ROI plus {int(FORCING_BUFFER_M / 1000)} km buffer, trimmed to the project window.
 - Station snow depth: {station_count} ROI stations in `obs/stations`, with `use_for_da` and `use_for_benchmark` role flags.
-- FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; selected per subdomain with at most {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
-- Maps: `projects/{PROJECT_NAME}/maps.yml` adds a setup overview plus focused snow-depth/SWE response maps on selected DA dates. Generated DA-event maps are still rendered automatically from the configured assimilation events.
+- FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; configured as project-level event candidates. The subdomain event filter drops cloudy subdomain/date combinations above {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
+- DA config: 30 ensemble members, ESS threshold ratio 0.7, full output retention, and four-variable forcing/rejuvenation perturbations for temperature, precipitation, humidity, and shortwave radiation.
+- Maps: `projects/{PROJECT_NAME}/maps.yml` adds a setup overview. Generated DA-event maps are rendered automatically from the configured assimilation events.
 
 Run the example with:
 
 ```bash
-oa-da-subdomain pipeline --setup-dir examples/subdomains --project-dir examples/subdomains/projects/{PROJECT_NAME} --regions examples/subdomains/env/subdomains.gpkg --station-buffer-km 10 --max-workers 8 --inner-max-workers 3 --overwrite
+oa-da-subdomain pipeline --setup-dir examples/subdomains --project-dir examples/subdomains/projects/{PROJECT_NAME} --regions examples/subdomains/env/subdomains.gpkg --station-buffer-km 10 --grid-buffer-m {int(SUBDOMAIN_GRID_BUFFER_M)} --max-workers 8 --inner-max-workers 3 --overwrite
 ```
 
 The FRAMES-specific build logic is external to `openamundsen_da`:
-`/home/franz/workspace/repos/scripts/04-openAMUNDSEN/buildNorthTyrolSubdomainExample.py`.
+`/home/franz/workspace/repos/scripts/04-openAMUNDSEN/buildSubdomainExample.py`.
 """
     (example_dir / "README.md").write_text(text, encoding="utf-8")
 
@@ -1057,7 +1060,7 @@ The FRAMES-specific build logic is external to `openamundsen_da`:
 
 Inherit `examples/AGENTS.md`. This file adds local rules for the canonical sub-domain baseline.
 
-- `examples/subdomains` is the shipped North Tyrol sub-domain regression setup and must stay compatible with the CI sub-domain pipelines.
+- `examples/subdomains` is the shipped sub-domain regression setup and must stay compatible with the CI sub-domain pipelines.
 - Keep `env/subdomains.gpkg`, project layout, and expected merged outputs aligned with `scripts/ci/run_integration_tests_subdomain.sh` and `scripts/ci/run_integration_tests_model_subdomain.sh`.
 - If sub-domain reports, manifests, event filtering, or output paths change, update validators, tests, and docs in the same work.
 - Preserve deterministic region handling and merged project-level outputs because CI validates them as a contract.
@@ -1079,7 +1082,7 @@ def _write_manifest(
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "archive_path": str(archive_path) if archive_path else None,
         "source_paths": {
-            "roi": str(ROI_PATH),
+            "roi": str(_subdomain_roi_source() or ROI_PATH),
             "raw_subregions": str(RAW_SUBREGIONS_PATH),
             "forcing": str(FORCING_DIR),
             "forcing_meta": str(FORCING_META),
@@ -1138,6 +1141,7 @@ def build(*, no_archive: bool = False) -> None:
     _write_setup_yaml(EXAMPLE_DIR, stations)
     _write_project_yaml(EXAMPLE_DIR, station_events, scf_events)
     _write_maps_yaml(EXAMPLE_DIR)
+    _write_plots_yaml(EXAMPLE_DIR)
     _write_readme(EXAMPLE_DIR, station_count=len(stations), forcing_count=len(forcing), scf_events=scf_events)
     _write_manifest(
         EXAMPLE_DIR,
