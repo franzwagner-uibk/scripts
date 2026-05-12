@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -36,6 +36,7 @@ if not FRAMES_DATA.exists() and (WORKSPACE / "01-data").exists():
     FRAMES_DATA = WORKSPACE / "01-data"
 EXAMPLE_DIR = OPENAMUNDSEN_DA / "examples" / "subdomains"
 ARCHIVE_ROOT = WORKSPACE / "dev_examples" / "archive"
+EUREGIO_EXAMPLE_DIR = WORKSPACE / "dev_examples" / "euregio_subdomains"
 
 ROI_PATH = FRAMES_DATA / "01-aoi" / "TESTSITES" / "Testsite_North_Tyrol.gpkg"
 RAW_SUBREGIONS_PATH = FRAMES_DATA / "01-aoi" / "SUBREGIONS" / "raw" / "subregions_avalanche_report_raw_25832.gpkg"
@@ -87,12 +88,18 @@ FSC_EVENT_CANDIDATES = [
 RESOLUTIONS = (50, 100, 250, 500)
 BUILD_RESOLUTIONS = (100, 250, 500, 50)
 DEFAULT_RESOLUTION = 100
+EUREGIO_RESOLUTIONS = (100, 250)
+EUREGIO_BUILD_RESOLUTIONS = (250, 100)
+EUREGIO_DEFAULT_RESOLUTION = 250
 FORCING_BUFFER_M = 10_000.0
 GRID_CROP_BUFFER_M = 10_000.0
 SUBDOMAIN_GRID_BUFFER_M = 10_000.0
 FSC_MAX_CLOUD_FRACTION = 0.20
 FSC_SUBDOMAIN_CLOUD_OVERRIDES = {"AT-07-20": 0.25}
 FSC_CLOUD_CLASSES = (210.0, 215.0)
+BIWEEKLY_SPACING_DAYS = 14
+EVENT_SHIFT_DAYS = 4
+HIGH_SEASON_MONTHS = {12, 1, 2, 3}
 
 
 @dataclass(frozen=True)
@@ -101,6 +108,17 @@ class ScfCandidate:
     zip_name: str
     cloud_by_subdomain: dict[str, float]
     selected_for_subdomains: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BuildOptions:
+    region_set: str
+    example_dir: Path
+    domain: str
+    resolutions: tuple[int, ...]
+    build_resolutions: tuple[int, ...]
+    default_resolution: int
+    compact_output: bool
 
 
 def _flow(values: Iterable[object]):
@@ -141,26 +159,33 @@ def _clean_output(example_dir: Path) -> None:
         (example_dir / name).mkdir(parents=True, exist_ok=True)
 
 
-def _subdomain_roi_source() -> Path | None:
-    roi_source = ROI_PATH if ROI_PATH.is_file() else EXAMPLE_DIR / "env" / "subdomains.gpkg"
+def _subdomain_roi_source(example_dir: Path = EXAMPLE_DIR) -> Path | None:
+    roi_source = ROI_PATH if ROI_PATH.is_file() else example_dir / "env" / "subdomains.gpkg"
     if not roi_source.is_file():
         return None
     return roi_source
 
 
-def _read_subdomains() -> gpd.GeoDataFrame:
-    roi_source = _subdomain_roi_source()
+def _read_subdomains(region_set: str, example_dir: Path = EXAMPLE_DIR) -> gpd.GeoDataFrame:
+    raw = gpd.read_file(RAW_SUBREGIONS_PATH).to_crs("EPSG:25832")
+    raw["id"] = raw["id"].astype(str).astype(object)
+    raw["geometry"] = raw.geometry.buffer(0)
+    if region_set == "euregio":
+        if len(raw) != 90:
+            raise ValueError(f"Expected 90 Euregio avalanche-report subdomains in {RAW_SUBREGIONS_PATH}, got {len(raw)}")
+        return _make_non_overlapping(raw[["id", "geometry"]].copy())
+
+    roi_source = _subdomain_roi_source(example_dir)
     if roi_source is None:
         raise FileNotFoundError(f"Subdomain example ROI source not found: {ROI_PATH}")
     roi = gpd.read_file(roi_source).to_crs("EPSG:25832")
     roi["geometry"] = roi.geometry.buffer(0)
     if len(roi) != 8:
-        raise ValueError(f"Expected 8 subdomains in {ROI_PATH}, got {len(roi)}")
+        raise ValueError(f"Expected 8 subdomains in {roi_source}, got {len(roi)}")
     if "id" not in roi.columns:
-        raise ValueError(f"ROI layer missing id column: {ROI_PATH}")
+        raise ValueError(f"ROI layer missing id column: {roi_source}")
     roi["id"] = roi["id"].astype(str).astype(object)
 
-    raw = gpd.read_file(RAW_SUBREGIONS_PATH).to_crs(roi.crs)
     raw_ids = set(raw["id"].astype(str))
     missing = sorted(set(roi["id"].astype(str)) - raw_ids)
     if missing:
@@ -184,13 +209,13 @@ def _make_non_overlapping(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return out
 
 
-def _write_vectors(example_dir: Path, subdomains: gpd.GeoDataFrame) -> BaseGeometry:
+def _write_vectors(example_dir: Path, subdomains: gpd.GeoDataFrame, *, domain: str = DOMAIN) -> BaseGeometry:
     env_dir = example_dir / "env"
     subdomains = subdomains.copy()
     subdomains["id"] = subdomains["id"].astype(str).astype(object)
     subdomains.to_file(env_dir / "subdomains.gpkg", driver="GPKG")
     roi_geom = unary_union(list(subdomains.geometry))
-    roi_attrs = pd.DataFrame({"id": pd.Series(["subdomain_example"], dtype=object)})
+    roi_attrs = pd.DataFrame({"id": pd.Series([domain], dtype=object)})
     gpd.GeoDataFrame(roi_attrs, geometry=[roi_geom], crs=subdomains.crs).to_file(
         env_dir / "roi.gpkg",
         driver="GPKG",
@@ -318,19 +343,25 @@ def _write_neutral_svf(dem_path: Path, dst: Path) -> None:
     )
 
 
-def _write_grids(example_dir: Path, roi_geom: BaseGeometry, resolutions: Iterable[int]) -> dict[int, dict[str, Path]]:
+def _write_grids(
+    example_dir: Path,
+    roi_geom: BaseGeometry,
+    resolutions: Iterable[int],
+    *,
+    domain: str = DOMAIN,
+) -> dict[int, dict[str, Path]]:
     bounds = roi_geom.buffer(GRID_CROP_BUFFER_M).bounds
     out: dict[int, dict[str, Path]] = {}
     for res in resolutions:
         res_paths: dict[str, Path] = {}
-        dem_dst = example_dir / "grids" / f"dem_{DOMAIN}_{res}.asc"
+        dem_dst = example_dir / "grids" / f"dem_{domain}_{res}.asc"
         _crop_ascii_grid(_grid_source("dem", res), dem_dst, bounds)
         res_paths["dem"] = dem_dst
         for key in ("lc", "srf"):
-            dst = example_dir / "grids" / f"{key}_{DOMAIN}_{res}.asc"
+            dst = example_dir / "grids" / f"{key}_{domain}_{res}.asc"
             _crop_ascii_grid(_grid_source(key, res), dst, bounds)
             res_paths[key] = dst
-        svf_dst = example_dir / "grids" / f"svf_{DOMAIN}_{res}.asc"
+        svf_dst = example_dir / "grids" / f"svf_{domain}_{res}.asc"
         _write_neutral_svf(dem_dst, svf_dst)
         res_paths["svf"] = svf_dst
         out[res] = res_paths
@@ -440,6 +471,9 @@ def _write_snow_observations(
     example_dir: Path,
     subdomains: gpd.GeoDataFrame,
     roi_geom: BaseGeometry,
+    *,
+    require_expected_count: bool = True,
+    require_every_subdomain: bool = True,
 ) -> tuple[pd.DataFrame, list[date]]:
     meta = pd.read_csv(SNOW_OBS_DIR / "stations_snow_depth.csv")
     required = {"id", "name", "lat", "lon", "alt", "x", "y"}
@@ -453,7 +487,7 @@ def _write_snow_observations(
     )
     selected = gdf.loc[gdf.geometry.within(roi_geom)].copy()
     selected["id"] = selected["id"].map(_normalize_station_id)
-    if len(selected) != 35:
+    if require_expected_count and len(selected) != 35:
         raise ValueError(f"Expected 35 snow stations inside ROI, got {len(selected)}")
 
     obs_dir = example_dir / "obs" / "stations"
@@ -468,7 +502,14 @@ def _write_snow_observations(
     selected.drop(columns=["geometry"]).sort_values("id").to_csv(obs_dir / "stations_snow_depth.csv", index=False)
     metadata = _station_da_metadata(selected, subdomains, coverage)
     metadata.to_csv(obs_dir / "stations_da_metadata.csv", index=False)
-    station_events = _select_station_events(subdomains, selected, metadata, coverage)
+    station_events = _select_station_events(
+        subdomains,
+        selected,
+        metadata,
+        coverage,
+        require_every_subdomain=require_every_subdomain,
+    )
+    _write_station_support_table(example_dir, subdomains, selected, metadata)
     print(f"wrote snow stations: {len(selected)}; station events: {[d.isoformat() for d in station_events]}", flush=True)
     return selected.drop(columns=["geometry"]).reset_index(drop=True), station_events
 
@@ -525,26 +566,82 @@ def _select_station_events(
     stations: gpd.GeoDataFrame,
     metadata: pd.DataFrame,
     coverage: dict[str, set[date]],
+    *,
+    require_every_subdomain: bool = True,
 ) -> list[date]:
     lookup = _station_subdomain_lookup(subdomains, stations)
     da_enabled = set(metadata.loc[metadata["use_for_da"].astype(bool), "station_id"].astype(str))
+    station_ids_by_subdomain = {
+        sub_id: [
+            station_id
+            for station_id, station_sub_id in lookup.items()
+            if station_sub_id == sub_id and station_id in da_enabled
+        ]
+        for sub_id in subdomains["id"].astype(str)
+    }
+    required_subdomains = [
+        sub_id
+        for sub_id, station_ids in station_ids_by_subdomain.items()
+        if require_every_subdomain or station_ids
+    ]
+    if not required_subdomains:
+        return []
+
+    candidate_dates = STATION_EVENT_CANDIDATES
+    if not require_every_subdomain:
+        all_dates = sorted({dt for station_id in da_enabled for dt in coverage.get(station_id, set())})
+        candidate_dates = [dt for dt in all_dates if SEASON_START <= dt <= SEASON_END and dt.month in HIGH_SEASON_MONTHS]
+
     events: list[date] = []
-    for event_date in STATION_EVENT_CANDIDATES:
+    for event_date in candidate_dates:
         ok = True
-        for sub_id in subdomains["id"].astype(str):
-            station_ids = [
-                station_id
-                for station_id, station_sub_id in lookup.items()
-                if station_sub_id == sub_id and station_id in da_enabled
-            ]
+        for sub_id in required_subdomains:
+            station_ids = station_ids_by_subdomain[sub_id]
             if not any(event_date in coverage.get(station_id, set()) for station_id in station_ids):
                 ok = False
                 break
         if ok:
             events.append(event_date)
-    if len(events) < 5:
+
+    if not require_every_subdomain:
+        events = _thin_dates_by_spacing(events, spacing_days=28)
+    if len(events) < 5 and require_every_subdomain:
         raise ValueError(f"Too few station events with DA support in every subdomain: {events}")
     return events
+
+
+def _write_station_support_table(
+    example_dir: Path,
+    subdomains: gpd.GeoDataFrame,
+    stations: gpd.GeoDataFrame,
+    metadata: pd.DataFrame,
+) -> None:
+    lookup = _station_subdomain_lookup(subdomains, stations)
+    da_enabled = set(metadata.loc[metadata["use_for_da"].astype(bool), "station_id"].astype(str))
+    benchmark_enabled = set(metadata.loc[metadata["use_for_benchmark"].astype(bool), "station_id"].astype(str))
+    rows = []
+    for sub_id in subdomains["id"].astype(str):
+        station_ids = sorted(station_id for station_id, station_sub_id in lookup.items() if station_sub_id == sub_id)
+        rows.append(
+            {
+                "subdomain_id": sub_id,
+                "station_count": len(station_ids),
+                "da_station_count": sum(station_id in da_enabled for station_id in station_ids),
+                "benchmark_station_count": sum(station_id in benchmark_enabled for station_id in station_ids),
+            }
+        )
+    (example_dir / "obs" / "stations").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(example_dir / "obs" / "stations" / "station_support_by_subdomain.csv", index=False)
+
+
+def _thin_dates_by_spacing(dates: Iterable[date], *, spacing_days: int) -> list[date]:
+    selected: list[date] = []
+    last: date | None = None
+    for dt in sorted(set(dates)):
+        if last is None or (dt - last).days >= spacing_days:
+            selected.append(dt)
+            last = dt
+    return selected
 
 
 def _scf_zip_entries() -> list[tuple[date, str]]:
@@ -718,7 +815,88 @@ def _select_scf_events_by_subdomain(
     ]
 
 
-def _write_scf_files(example_dir: Path, selected: list[ScfCandidate], roi_geom: BaseGeometry) -> None:
+def _target_slots(*, spacing_days: int = BIWEEKLY_SPACING_DAYS) -> list[date]:
+    slots: list[date] = []
+    current = SEASON_START
+    while current <= SEASON_END:
+        slots.append(current)
+        current += timedelta(days=spacing_days)
+    return slots
+
+
+def _select_biweekly_scf_events_by_subdomain(
+    candidates: list[ScfCandidate],
+    subdomains: gpd.GeoDataFrame,
+    *,
+    shift_days: int = EVENT_SHIFT_DAYS,
+) -> list[ScfCandidate]:
+    selected: list[ScfCandidate] = []
+    used_dates: set[date] = set()
+    subdomain_ids = sorted(subdomains["id"].astype(str))
+    for target in _target_slots():
+        window_start = target - timedelta(days=shift_days)
+        window_end = target + timedelta(days=shift_days)
+        window = [
+            cand
+            for cand in candidates
+            if window_start <= cand.date <= window_end and cand.date not in used_dates
+        ]
+        if not window:
+            continue
+
+        scored: list[tuple[int, float, int, ScfCandidate, tuple[str, ...]]] = []
+        for cand in window:
+            selected_for = tuple(
+                sorted(
+                    subdomain_id
+                    for subdomain_id in subdomain_ids
+                    if cand.cloud_by_subdomain[subdomain_id] <= _scf_limit_for_subdomain(subdomain_id)
+                )
+            )
+            if not selected_for:
+                continue
+            mean_cloud = float(np.mean([cand.cloud_by_subdomain[sub_id] for sub_id in selected_for]))
+            distance = abs((cand.date - target).days)
+            scored.append((len(selected_for), -mean_cloud, -distance, cand, selected_for))
+        if not scored:
+            continue
+        _, _, _, cand, selected_for = max(scored, key=lambda item: (item[0], item[1], item[2]))
+        selected.append(
+            ScfCandidate(
+                cand.date,
+                cand.zip_name,
+                cand.cloud_by_subdomain,
+                selected_for_subdomains=selected_for,
+            )
+        )
+        used_dates.add(cand.date)
+
+    if not selected:
+        raise ValueError("No biweekly FSC events could be selected from SnowFLAKES source")
+    coverage = {
+        sub_id: sum(sub_id in cand.selected_for_subdomains for cand in selected)
+        for sub_id in subdomain_ids
+    }
+    missing = [sub_id for sub_id, count in coverage.items() if count == 0]
+    if missing:
+        raise ValueError(f"Biweekly FSC selection leaves subdomains without FSC support: {missing}")
+
+    print("selected biweekly FSC events:", flush=True)
+    for cand in selected:
+        print(
+            f"  {cand.date.isoformat()}: eligible {len(cand.selected_for_subdomains)}/{len(subdomain_ids)}",
+            flush=True,
+        )
+    return sorted(selected, key=lambda cand: cand.date)
+
+
+def _write_scf_files(
+    example_dir: Path,
+    selected: list[ScfCandidate],
+    roi_geom: BaseGeometry,
+    *,
+    domain: str = DOMAIN,
+) -> None:
     out_dir = example_dir / "obs" / "snowcover"
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="subdomain_example_scf_clip_") as tmp, zipfile.ZipFile(_scf_zip_path()) as zf:
@@ -728,7 +906,7 @@ def _write_scf_files(example_dir: Path, selected: list[ScfCandidate], roi_geom: 
             subset = None
             try:
                 subset = _subset_scf_dataset(extracted, roi_geom.bounds)
-                out = out_dir / f"SnowFLAKES_{cand.date.strftime('%Y%m%d')}_v3_eurac_subdomain_example.nc"
+                out = out_dir / f"SnowFLAKES_{cand.date.strftime('%Y%m%d')}_v3_eurac_{domain}.nc"
                 encoding = {
                     "fsc": {"zlib": True, "complevel": 4, "dtype": "float32"},
                     "uncertainty": {"zlib": True, "complevel": 4, "dtype": "float32"},
@@ -744,14 +922,20 @@ def _write_scf_files(example_dir: Path, selected: list[ScfCandidate], roi_geom: 
                 extracted.unlink(missing_ok=True)
 
 
-def _write_setup_yaml(example_dir: Path, stations: pd.DataFrame) -> None:
+def _write_setup_yaml(
+    example_dir: Path,
+    stations: pd.DataFrame,
+    *,
+    domain: str = DOMAIN,
+    default_resolution: int = DEFAULT_RESOLUTION,
+) -> None:
     points = [
         {"x": float(row.x), "y": float(row.y), "name": str(row.id)}
         for row in stations.sort_values("id").itertuples(index=False)
     ]
     setup = {
-        "domain": DOMAIN,
-        "resolution": DEFAULT_RESOLUTION,
+        "domain": domain,
+        "resolution": default_resolution,
         "timestep": "3H",
         "crs": "epsg:25832",
         "timezone": 1,
@@ -779,9 +963,7 @@ def _write_setup_yaml(example_dir: Path, stations: pd.DataFrame) -> None:
                 "format": "netcdf",
                 "compress": True,
                 "variables": [
-                    {"var": "snow.swe", "name": "swe_daily", "freq": "D"},
                     {"var": "snow.depth", "name": "snowdepth_daily", "freq": "D"},
-                    {"var": "snow.liquid_water_content", "name": "liquid_water_content", "freq": "D", "agg": "mean"},
                 ],
             },
         },
@@ -845,7 +1027,14 @@ def _write_setup_yaml(example_dir: Path, stations: pd.DataFrame) -> None:
     _dump_yaml(example_dir / "subdomains.yml", setup)
 
 
-def _write_project_yaml(example_dir: Path, station_events: list[date], scf_events: list[ScfCandidate]) -> None:
+def _write_project_yaml(
+    example_dir: Path,
+    station_events: list[date],
+    scf_events: list[ScfCandidate],
+    *,
+    compact_output: bool = False,
+    fsc_unc_min: float = 5.0,
+) -> None:
     events = [
         *({"date": dt.isoformat(), "variable": "station_hs", "product": "STATION"} for dt in station_events),
         *({"date": cand.date.isoformat(), "variable": "scf", "product": "SNOWCOVER"} for cand in scf_events),
@@ -896,7 +1085,7 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                     for subdomain_id, threshold in FSC_SUBDOMAIN_CLOUD_OVERRIDES.items()
                 },
             },
-            "landcover_mask": {"enabled": True, "classes_to_exclude": _flow([2, 3, 8, 9, 10, 11, 12, 13])},
+            "landcover_mask": {"enabled": True, "classes_to_exclude": _flow([2, 3, 13])},
             "likelihood": {
                 "scf": {
                     "obs_sigma": 0.10,
@@ -910,11 +1099,20 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                 "scf": {
                     "enabled": True,
                     "input_dir": "obs/snowcover",
-                    "ingest": {"scf_variable": "fsc", "uncertainty_variable": "uncertainty", "time_variable": "time"},
+                    "ingest": {"scf_variable": "fsc", "uncertainty_source": "internal", "time_variable": "time"},
                     "assimilation": {"sigma_mode": "uncertainty_layer", "aggregate_metric": "unc_mean"},
-                    "u_min": 10.0,
+                    "u_min": float(fsc_unc_min),
                     "u_max": 20.0,
-                    "fallback_uncertainty": 15.0,
+                    "nodata_value": 255.0,
+                    "penalties": [
+                        {
+                            "name": "forest",
+                            "source": "landcover",
+                            "enabled": True,
+                            "classes": _flow([8, 9, 10, 11, 12]),
+                            "penalty": 20.0,
+                        }
+                    ],
                 }
             },
             "resampling": {"algorithm": "systematic", "ess_threshold_ratio": 0.7, "seed": 42},
@@ -928,7 +1126,7 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
             },
             "restart": {"use_state": True, "dump_state": True, "state_pattern": "model_state.pickle.gz"},
             "output": {
-                "retention": "full",
+                "retention": "compact" if compact_output else "full",
                 "grids": {
                     "format": "netcdf",
                     "compress": True,
@@ -937,12 +1135,7 @@ def _write_project_yaml(example_dir: Path, station_events: list[date], scf_event
                         {
                             "var": "snowdepth_daily",
                             "name": "snowdepth_daily",
-                            "metrics": _flow(["open_loop", "ens_mean", "ens_std", "ens_min", "ens_max", "increment"]),
-                        },
-                        {
-                            "var": "swe_daily",
-                            "name": "swe_daily",
-                            "metrics": _flow(["open_loop", "ens_mean", "ens_std", "ens_min", "ens_max", "increment"]),
+                            "metrics": _flow(["open_loop", "ens_mean", "increment", "analysis_mean", "analysis_increment"]),
                         },
                     ],
                 },
@@ -1031,24 +1224,40 @@ panels:
     (example_dir / "projects" / PROJECT_NAME / "plots.yml").write_text(text, encoding="utf-8")
 
 
-def _write_readme(example_dir: Path, station_count: int, forcing_count: int, scf_events: list[ScfCandidate]) -> None:
+def _write_readme(
+    example_dir: Path,
+    station_count: int,
+    forcing_count: int,
+    scf_events: list[ScfCandidate],
+    *,
+    region_set: str = "north-tyrol",
+    resolutions: tuple[int, ...] = RESOLUTIONS,
+    default_resolution: int = DEFAULT_RESOLUTION,
+    compact_output: bool = False,
+) -> None:
+    domain_text = "the full Euregio avalanche-report region set" if region_set == "euregio" else "a larger alpine ROI as 8 avalanche-report subdomains"
+    station_text = (
+        f"{station_count} North Tyrol station snow-depth series in `obs/stations`; station DA/benchmarking is only available in subdomains with local station support"
+        if region_set == "euregio"
+        else f"{station_count} ROI stations in `obs/stations`, with `use_for_da` and `use_for_benchmark` role flags"
+    )
     text = f"""# Subdomain Example
 
-This shipped example covers a larger alpine ROI as 8 avalanche-report subdomains.
+This setup covers {domain_text}.
 
 - Spatial domain: `env/subdomains.gpkg` and `env/roi.gpkg`, EPSG:25832.
 - Temporal domain: `{START_DATE}` to `{END_DATE}`.
-- Default resolution: `{DEFAULT_RESOLUTION} m`; available grid resolutions: `{', '.join(map(str, RESOLUTIONS))} m`.
+- Default resolution: `{default_resolution} m`; available grid resolutions: `{', '.join(map(str, resolutions))} m`.
 - Forcing: {forcing_count} `openamundsen-v2` stations within the ROI plus {int(FORCING_BUFFER_M / 1000)} km buffer, trimmed to the project window.
-- Station snow depth: {station_count} ROI stations in `obs/stations`, with `use_for_da` and `use_for_benchmark` role flags.
+- Station snow depth: {station_text}.
 - FSC: {len(scf_events)} clipped SnowFLAKES NetCDF files in `obs/snowcover`; configured as project-level event candidates. The subdomain event filter drops cloudy subdomain/date combinations above {FSC_MAX_CLOUD_FRACTION:.0%} cloud cover, except documented per-subdomain overrides in the project YAML.
-- DA config: 30 ensemble members, ESS threshold ratio 0.7, full output retention, and four-variable forcing/rejuvenation perturbations for temperature, precipitation, humidity, and shortwave radiation.
+- DA config: 30 ensemble members, ESS threshold ratio 0.7, {"compact" if compact_output else "full"} output retention, and four-variable forcing/rejuvenation perturbations for temperature, precipitation, humidity, and shortwave radiation.
 - Maps: `projects/{PROJECT_NAME}/maps.yml` adds a setup overview. Generated DA-event maps are rendered automatically from the configured assimilation events.
 
 Run the example with:
 
 ```bash
-oa-da-subdomain pipeline --setup-dir examples/subdomains --project-dir examples/subdomains/projects/{PROJECT_NAME} --regions examples/subdomains/env/subdomains.gpkg --station-buffer-km 10 --grid-buffer-m {int(SUBDOMAIN_GRID_BUFFER_M)} --max-workers 8 --inner-max-workers 3 --overwrite
+oa-da-subdomain pipeline --setup-dir {example_dir} --project-dir {example_dir}/projects/{PROJECT_NAME} --regions {example_dir}/env/subdomains.gpkg --station-buffer-km 10 --grid-buffer-m {int(SUBDOMAIN_GRID_BUFFER_M)} --max-workers 8 --inner-max-workers 3 --overwrite
 ```
 
 The FRAMES-specific build logic is external to `openamundsen_da`:
@@ -1077,12 +1286,19 @@ def _write_manifest(
     scf_events: list[ScfCandidate],
     forcing_count: int,
     station_count: int,
+    *,
+    region_set: str = "north-tyrol",
+    domain: str = DOMAIN,
+    resolutions: tuple[int, ...] = RESOLUTIONS,
+    default_resolution: int = DEFAULT_RESOLUTION,
+    compact_output: bool = False,
 ) -> None:
     manifest = {
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "archive_path": str(archive_path) if archive_path else None,
+        "region_set": region_set,
         "source_paths": {
-            "roi": str(_subdomain_roi_source() or ROI_PATH),
+            "roi": str(_subdomain_roi_source(example_dir) or ROI_PATH),
             "raw_subregions": str(RAW_SUBREGIONS_PATH),
             "forcing": str(FORCING_DIR),
             "forcing_meta": str(FORCING_META),
@@ -1090,12 +1306,13 @@ def _write_manifest(
             "scf_zip": str(SCF_ZIP_SOURCE),
             "scf_zip_cache": str(SCF_ZIP_CACHE) if SCF_ZIP_CACHE.exists() else None,
         },
-        "domain": DOMAIN,
+        "domain": domain,
         "project": PROJECT_NAME,
         "start_date": START_DATE,
         "end_date": END_DATE,
-        "resolutions": list(RESOLUTIONS),
-        "default_resolution": DEFAULT_RESOLUTION,
+        "resolutions": list(resolutions),
+        "default_resolution": default_resolution,
+        "compact_output": compact_output,
         "forcing_station_count": forcing_count,
         "snow_station_count": station_count,
         "station_events": [d.isoformat() for d in station_events],
@@ -1123,42 +1340,103 @@ def _write_manifest(
                 }
             )
     pd.DataFrame(rows).to_csv(example_dir / "obs" / "snowcover" / "selected_scf_quality.csv", index=False)
+    pd.DataFrame(rows).to_csv(example_dir / "obs" / "snowcover" / "fsc_quality_by_subdomain_date.csv", index=False)
 
 
-def build(*, no_archive: bool = False) -> None:
-    subdomains = _read_subdomains()
-    archive_path = None if no_archive else _archive_existing_example(EXAMPLE_DIR, ARCHIVE_ROOT)
-    _clean_output(EXAMPLE_DIR)
-    roi_geom = _write_vectors(EXAMPLE_DIR, subdomains)
-    _write_grids(EXAMPLE_DIR, roi_geom, BUILD_RESOLUTIONS)
-    forcing = _write_forcing(EXAMPLE_DIR, roi_geom)
-    stations, station_events = _write_snow_observations(EXAMPLE_DIR, subdomains, roi_geom)
+def _build_options(region_set: str, output_dir: Path | None) -> BuildOptions:
+    if region_set == "euregio":
+        return BuildOptions(
+            region_set=region_set,
+            example_dir=(output_dir or EUREGIO_EXAMPLE_DIR),
+            domain="euregio_subdomain_example",
+            resolutions=EUREGIO_RESOLUTIONS,
+            build_resolutions=EUREGIO_BUILD_RESOLUTIONS,
+            default_resolution=EUREGIO_DEFAULT_RESOLUTION,
+            compact_output=True,
+        )
+    return BuildOptions(
+        region_set="north-tyrol",
+        example_dir=(output_dir or EXAMPLE_DIR),
+        domain=DOMAIN,
+        resolutions=RESOLUTIONS,
+        build_resolutions=BUILD_RESOLUTIONS,
+        default_resolution=DEFAULT_RESOLUTION,
+        compact_output=False,
+    )
+
+
+def build(*, no_archive: bool = False, region_set: str = "north-tyrol", output_dir: Path | None = None) -> None:
+    options = _build_options(region_set, output_dir)
+    subdomains = _read_subdomains(options.region_set, options.example_dir)
+    archive_path = None if no_archive else _archive_existing_example(options.example_dir, ARCHIVE_ROOT)
+    _clean_output(options.example_dir)
+    roi_geom = _write_vectors(options.example_dir, subdomains, domain=options.domain)
+    _write_grids(options.example_dir, roi_geom, options.build_resolutions, domain=options.domain)
+    forcing = _write_forcing(options.example_dir, roi_geom)
+    stations, station_events = _write_snow_observations(
+        options.example_dir,
+        subdomains,
+        roi_geom,
+        require_expected_count=(options.region_set == "north-tyrol"),
+        require_every_subdomain=(options.region_set == "north-tyrol"),
+    )
     scf_candidates = _scan_scf_candidates(subdomains, roi_geom, excluded_dates=set(station_events))
-    scf_events = _select_scf_events_by_subdomain(scf_candidates, subdomains)
+    scf_events = (
+        _select_biweekly_scf_events_by_subdomain(scf_candidates, subdomains)
+        if options.region_set == "euregio"
+        else _select_scf_events_by_subdomain(scf_candidates, subdomains)
+    )
     if len(scf_events) < 8:
         raise ValueError(f"Too few FSC events selected: {len(scf_events)}")
-    _write_scf_files(EXAMPLE_DIR, scf_events, roi_geom)
-    _write_setup_yaml(EXAMPLE_DIR, stations)
-    _write_project_yaml(EXAMPLE_DIR, station_events, scf_events)
-    _write_maps_yaml(EXAMPLE_DIR)
-    _write_plots_yaml(EXAMPLE_DIR)
-    _write_readme(EXAMPLE_DIR, station_count=len(stations), forcing_count=len(forcing), scf_events=scf_events)
+    _write_scf_files(options.example_dir, scf_events, roi_geom, domain=options.domain)
+    _write_setup_yaml(options.example_dir, stations, domain=options.domain, default_resolution=options.default_resolution)
+    _write_project_yaml(
+        options.example_dir,
+        station_events,
+        scf_events,
+        compact_output=options.compact_output,
+        fsc_unc_min=5.0,
+    )
+    _write_maps_yaml(options.example_dir)
+    _write_plots_yaml(options.example_dir)
+    _write_readme(
+        options.example_dir,
+        station_count=len(stations),
+        forcing_count=len(forcing),
+        scf_events=scf_events,
+        region_set=options.region_set,
+        resolutions=options.resolutions,
+        default_resolution=options.default_resolution,
+        compact_output=options.compact_output,
+    )
     _write_manifest(
-        EXAMPLE_DIR,
+        options.example_dir,
         archive_path=archive_path,
         station_events=station_events,
         scf_events=scf_events,
         forcing_count=len(forcing),
         station_count=len(stations),
+        region_set=options.region_set,
+        domain=options.domain,
+        resolutions=options.resolutions,
+        default_resolution=options.default_resolution,
+        compact_output=options.compact_output,
     )
-    print(f"built example -> {EXAMPLE_DIR}", flush=True)
+    print(f"built example -> {options.example_dir}", flush=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-archive", action="store_true", help="Do not archive the existing examples/subdomains directory first")
+    parser.add_argument(
+        "--region-set",
+        choices=("north-tyrol", "euregio"),
+        default="north-tyrol",
+        help="Subdomain region set to build (default: north-tyrol shipped example)",
+    )
+    parser.add_argument("--output-dir", type=Path, help="Output setup directory (default depends on --region-set)")
     args = parser.parse_args()
-    build(no_archive=bool(args.no_archive))
+    build(no_archive=bool(args.no_archive), region_set=args.region_set, output_dir=args.output_dir)
     return 0
 
 
