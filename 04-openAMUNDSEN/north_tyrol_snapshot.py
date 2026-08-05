@@ -1656,6 +1656,29 @@ def _relativize_staging_paths(value: Any, staging: Path) -> Any:
     return value
 
 
+def _builder_commit() -> str:
+    """Return the validated builder commit supplied by the execution environment."""
+
+    environment_commit = os.environ.get("NORTH_TYROL_SNAPSHOT_BUILDER_COMMIT")
+    if environment_commit is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", environment_commit):
+            raise ValueError("NORTH_TYROL_SNAPSHOT_BUILDER_COMMIT must be a 40-character SHA")
+        return environment_commit
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        commit = ""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError(
+            "Builder commit unavailable; set NORTH_TYROL_SNAPSHOT_BUILDER_COMMIT"
+        )
+    return commit
+
+
 def build_snapshot(options: SnapshotOptions) -> Path:
     """Build, validate and atomically promote one snapshot."""
 
@@ -1725,14 +1748,7 @@ def build_snapshot(options: SnapshotOptions) -> Path:
         validation = validate_snapshot(staging, seasons)
         working_hashes = _hash_tree(working_root)
         write_json(provenance_root / "working_files.json", working_hashes)
-        try:
-            builder_commit = subprocess.check_output(
-                ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            builder_commit = "unknown"
+        builder_commit = _builder_commit()
         manifest = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "status": "READY_FOR_EVENT_SELECTION",

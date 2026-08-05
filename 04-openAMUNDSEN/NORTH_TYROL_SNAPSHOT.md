@@ -48,6 +48,10 @@ Remove `--preflight` only after reviewing its counts and target. A normal build
 refuses an existing final target, builds in a timestamped staging directory and
 atomically promotes only a snapshot that passes all validations.
 
+When the runtime image does not contain Git, set
+`NORTH_TYROL_SNAPSHOT_BUILDER_COMMIT` to the exact 40-character commit checked
+out on the host. The build fails rather than writing unknown commit provenance.
+
 ## Tests
 
 ```bash

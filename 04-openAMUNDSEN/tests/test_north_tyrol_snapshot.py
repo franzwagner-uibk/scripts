@@ -19,6 +19,7 @@ from north_tyrol_snapshot import (  # noqa: E402
     PINNED_IMAGE,
     AsciiGridHeader,
     SnapshotOptions,
+    _builder_commit,
     _cropped_geotransform,
     _date_first,
     _forcing_source_extent,
@@ -258,6 +259,22 @@ def test_write_json_is_deterministic(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == json.dumps(
         {"z": 1, "a": [2, 3]}, indent=2, sort_keys=True
     ) + "\n"
+
+
+def test_builder_commit_uses_validated_environment_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    commit = "2" * 40
+    monkeypatch.setenv("NORTH_TYROL_SNAPSHOT_BUILDER_COMMIT", commit)
+
+    assert _builder_commit() == commit
+
+
+def test_builder_commit_rejects_invalid_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NORTH_TYROL_SNAPSHOT_BUILDER_COMMIT", "unknown")
+
+    with pytest.raises(ValueError, match="40-character SHA"):
+        _builder_commit()
 
 
 def test_preflight_discovers_complete_contract_fixture(tmp_path: Path) -> None:
