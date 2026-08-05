@@ -197,6 +197,7 @@ def finalize(root: Path, policy_path: Path, image: str) -> Path:
         _write_station_roles(staging, roles)
         _promote_project_configs(staging, schedules)
         _write_scheduler_inventories(staging, schedules, roles)
+        _prepare_partitioned_regions(staging, image)
         _prepare_all_projects(staging, image)
         _relativize_internal_symlinks(staging)
         acceptance = validate_final_snapshot(staging, image=image, verify_data_hashes=True)
@@ -358,7 +359,7 @@ def _prepare_all_projects(staging: Path, image: str) -> None:
             "prepare",
             container_project,
             "--regions",
-            "/setup/data_working/env/subdomains.gpkg",
+            "/setup/provenance/finalization_subdomains.gpkg",
             "--station-buffer-km",
             "50",
             "--grid-buffer-m",
@@ -392,6 +393,94 @@ def _prepare_all_projects(staging: Path, image: str) -> None:
                 script,
             ]
         )
+
+
+def _prepare_partitioned_regions(staging: Path, image: str) -> None:
+    """Derive a union-preserving, non-overlapping preparation vector."""
+
+    script = """
+import hashlib
+import json
+from pathlib import Path
+
+import geopandas as gpd
+from shapely.ops import unary_union
+
+source = Path('/setup/data_working/env/subdomains.gpkg')
+output = Path('/setup/provenance/finalization_subdomains.gpkg')
+report = Path('/setup/provenance/finalization_regions.json')
+frame = gpd.read_file(source)[['id', 'geometry']].copy()
+frame['id'] = frame['id'].astype(str)
+frame = frame.sort_values('id').reset_index(drop=True)
+if frame.crs is None or frame.crs.to_epsg() != 25832:
+    raise ValueError(f'Expected EPSG:25832 subdomains, got {frame.crs}')
+
+occupied = None
+partitioned = []
+records = []
+for row in frame.itertuples(index=False):
+    original = row.geometry.buffer(0)
+    geometry = original if occupied is None else original.difference(occupied).buffer(0)
+    if geometry.is_empty:
+        raise ValueError(f'Partition removed all geometry for {row.id}')
+    removed_area = max(0.0, float(original.area - geometry.area))
+    records.append({'subdomain_id': str(row.id), 'removed_overlap_area_m2': removed_area})
+    partitioned.append(geometry)
+    occupied = original if occupied is None else unary_union([occupied, original])
+
+result = gpd.GeoDataFrame({'id': frame['id']}, geometry=partitioned, crs=frame.crs)
+for index, left in enumerate(result.geometry):
+    for right in result.geometry.iloc[index + 1:]:
+        if left.intersection(right).area > 1.0e-6:
+            raise ValueError('Derived preparation regions still overlap')
+source_union = unary_union(list(frame.geometry))
+result_union = unary_union(list(result.geometry))
+union_difference = float(source_union.symmetric_difference(result_union).area)
+if union_difference > 1.0e-6:
+    raise ValueError(f'Derived regions changed the union by {union_difference} m2')
+result.to_file(output, driver='GPKG')
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as file_obj:
+        for chunk in iter(lambda: file_obj.read(8 * 1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+payload = {
+    'method': 'sorted_id_priority_difference',
+    'crs': 'EPSG:25832',
+    'source': 'data_working/env/subdomains.gpkg',
+    'source_sha256': sha256(source),
+    'output': 'provenance/finalization_subdomains.gpkg',
+    'output_sha256': sha256(output),
+    'source_union_area_m2': float(source_union.area),
+    'union_symmetric_difference_area_m2': union_difference,
+    'total_removed_overlap_area_m2': sum(item['removed_overlap_area_m2'] for item in records),
+    'subdomains': records,
+}
+report.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\\n', encoding='utf-8')
+"""
+    _run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--read-only",
+            "--network",
+            "none",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,noexec,size=1g",
+            "--volume",
+            f"{staging}:/setup:rw",
+            image,
+            "python",
+            "-c",
+            script,
+        ]
+    )
 
 
 def _normalize_subdomain_project_paths(staging: Path, project_name: str) -> None:
@@ -587,6 +676,7 @@ def _write_finalization_manifest(
         "image": image,
         "parent_manifest_sha256": initial["parent_manifest_sha256"],
         "pending_tree_sha256": initial["pending_tree_sha256"],
+        "preparation_regions": _read_json(staging / "provenance" / "finalization_regions.json"),
         "final_hash_scope": "all regular files except status markers and mutable top-level manifests",
         "final_hash": inventory_digest(final_inventory),
         "final_file_count": len(final_inventory),
