@@ -192,6 +192,22 @@ def test_source_state_refuses_existing_projects(tmp_path: Path) -> None:
         finalizer.validate_source_snapshot(root, finalizer.EXPECTED_IMAGE)
 
 
+def test_container_rooted_symlinks_become_internal_relative_links(tmp_path: Path) -> None:
+    root = tmp_path / "staging"
+    target = root / "data_working" / "meteo" / "station.csv"
+    target.parent.mkdir(parents=True)
+    target.write_text("time,temp\n", encoding="utf-8")
+    link = root / "projects" / "project" / "subdomains" / "AT-01" / "meteo" / "station.csv"
+    link.parent.mkdir(parents=True)
+    link.symlink_to("/setup/data_working/meteo/station.csv")
+
+    finalizer._relativize_internal_symlinks(root)
+
+    assert not Path(link.readlink()).is_absolute()
+    assert link.resolve(strict=True) == target
+    finalizer._validate_internal_symlinks(root)
+
+
 def test_finalizer_failure_leaves_canonical_tree_and_marks_staging_incomplete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
