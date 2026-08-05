@@ -22,6 +22,7 @@ from north_tyrol_snapshot import (  # noqa: E402
     _cropped_geotransform,
     _date_first,
     _forcing_source_extent,
+    _trim_incomplete_forcing_tail,
     _validated_geotransform,
     ascii_crop_window,
     classify_fsc,
@@ -178,6 +179,24 @@ def test_forcing_working_frame_places_normalized_date_first() -> None:
     assert ordered.columns.tolist() == ["date", "temp", "precip"]
 
 
+def test_forcing_tail_is_trimmed_to_last_native_model_grid_timestamp() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "date": pd.date_range("2021-10-18 07:00:00", periods=4, freq="h"),
+            "temp": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    trimmed, dropped = _trim_incomplete_forcing_tail(
+        frame, datetime(2017, 10, 1), Path("station.csv")
+    )
+
+    assert trimmed["date"].max() == pd.Timestamp("2021-10-18 09:00:00")
+    assert dropped == 1
+
+
 def test_project_configuration_is_pending_and_uses_correct_fsc_classes() -> None:
     project = project_configuration(hydrological_seasons(2022, 2022)[0])
     snowcover = project["obs"]["snowcover"]
@@ -278,7 +297,7 @@ def test_preflight_discovers_complete_contract_fixture(tmp_path: Path) -> None:
         elif index == 159:
             timestamps = "2017-09-30 00:00:00\n"
         elif index == 160:
-            timestamps = "2023-09-30 23:00:00\n"
+            timestamps = "2023-09-30 21:00:00\n"
         elif index == 161:
             timestamps = "2004-09-06 00:00:00\n2005-08-02 00:00:00\n"
         else:

@@ -417,8 +417,9 @@ def _forcing_source_extent(source: Path) -> tuple[datetime, datetime]:
 def _forcing_data_window(seasons: Sequence[Season]) -> tuple[datetime, datetime]:
     """Return the forcing selection window, including the model lookback day."""
 
-    data_start, data_end = overall_window(seasons)
-    return data_start - timedelta(days=1), data_end
+    if not seasons:
+        raise ValueError("At least one season is required")
+    return seasons[0].start - timedelta(days=1), seasons[-1].end
 
 
 def _date_first(frame: Any, source: Path) -> Any:
@@ -428,6 +429,26 @@ def _date_first(frame: Any, source: Path) -> Any:
         raise ValueError(f"Working forcing frame lacks date column: {source}")
     columns = ["date", *(column for column in frame.columns if column != "date")]
     return frame.loc[:, columns]
+
+
+def _trim_incomplete_forcing_tail(
+    frame: Any,
+    alignment_origin: datetime,
+    source: Path,
+) -> tuple[Any, int]:
+    """Drop only the trailing rows after the last native 3-hour grid timestamp."""
+
+    import pandas as pd
+
+    if frame.empty:
+        return frame, 0
+    offsets = frame["date"] - pd.Timestamp(alignment_origin)
+    aligned = offsets.mod(pd.Timedelta("3h")) == pd.Timedelta(0)
+    if not aligned.any():
+        raise ValueError(f"No forcing timestamps align with the 3 h model grid: {source}")
+    last_aligned = frame.loc[aligned, "date"].max()
+    trimmed = frame.loc[frame["date"] <= last_aligned].copy()
+    return trimmed, len(frame) - len(trimmed)
 
 
 def prepare_forcing(
@@ -491,6 +512,9 @@ def prepare_forcing(
         frame = frame.loc[(frame["date"] >= forcing_start) & (frame["date"] <= data_end)].copy()
         frame = frame.drop(columns=[time_column]) if time_column != "date" else frame
         frame = _date_first(frame, source)
+        frame, trailing_rows_dropped = _trim_incomplete_forcing_tail(
+            frame, data_start, source
+        )
         if frame.empty:
             raise ValueError(f"No forcing data in snapshot window: {source}")
         frame = frame.sort_values("date")
@@ -510,6 +534,7 @@ def prepare_forcing(
                     "station_id": station_id,
                     "variable": variable,
                     "source_variable_present": variable in source_variables,
+                    "trailing_off_grid_rows_dropped": trailing_rows_dropped,
                     "expected_hourly_count": len(in_model_window),
                     "valid_count": int(valid.sum()),
                     "missing_count": int((~valid).sum()),
@@ -536,6 +561,7 @@ def prepare_forcing(
         "station_id",
         "variable",
         "source_variable_present",
+        "trailing_off_grid_rows_dropped",
         "expected_hourly_count",
         "valid_count",
         "missing_count",
