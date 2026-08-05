@@ -19,6 +19,7 @@ from north_tyrol_snapshot import (  # noqa: E402
     PINNED_IMAGE,
     AsciiGridHeader,
     SnapshotOptions,
+    _forcing_source_extent,
     ascii_crop_window,
     classify_fsc,
     copy_verified,
@@ -109,6 +110,30 @@ def test_longest_missing_run(values: list[bool], expected: int) -> None:
     assert longest_missing_run(values) == expected
 
 
+def test_forcing_source_extent_accepts_supported_timestamp_column(tmp_path: Path) -> None:
+    source = tmp_path / "station.csv"
+    source.write_text(
+        "datetime,temp\n2017-09-30 00:00:00,1.0\n2023-09-30 21:00:00,2.0\n",
+        encoding="utf-8",
+    )
+
+    assert _forcing_source_extent(source) == (
+        datetime(2017, 9, 30, 0, 0),
+        datetime(2023, 9, 30, 21, 0),
+    )
+
+
+@pytest.mark.parametrize("contents", ["temp\n1.0\n", "date,temp\n"])
+def test_forcing_source_extent_rejects_missing_or_empty_timestamps(
+    tmp_path: Path, contents: str
+) -> None:
+    source = tmp_path / "station.csv"
+    source.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="column|timestamps"):
+        _forcing_source_extent(source)
+
+
 def test_project_configuration_is_pending_and_uses_correct_fsc_classes() -> None:
     project = project_configuration(hydrological_seasons(2022, 2022)[0])
     snowcover = project["obs"]["snowcover"]
@@ -193,7 +218,7 @@ def test_preflight_discovers_complete_contract_fixture(tmp_path: Path) -> None:
     forcing_meta_path = source / "01-data/02-meteo/02-meta/gpkg/meta-all.gpkg"
     forcing_dir.mkdir(parents=True)
     forcing_rows = []
-    for index in range(158):
+    for index in range(163):
         station_name = f"S{index:03d}"
         forcing_rows.append(
             {
@@ -204,8 +229,19 @@ def test_preflight_discovers_complete_contract_fixture(tmp_path: Path) -> None:
                 "geometry": Point(100.0 + (index % 8) * 1000.0, 500.0),
             }
         )
+        if index < 159:
+            timestamps = "2017-09-30 00:00:00\n2023-09-30 21:00:00\n"
+        elif index == 159:
+            timestamps = "2017-09-30 00:00:00\n"
+        elif index == 160:
+            timestamps = "2023-09-30 23:00:00\n"
+        elif index == 161:
+            timestamps = "2004-09-06 00:00:00\n2005-08-02 00:00:00\n"
+        else:
+            timestamps = "2023-10-09 00:00:00\n2024-12-02 00:00:00\n"
+        rows = "".join(f"{timestamp},1,1,1,1,1\n" for timestamp in timestamps.splitlines())
         (forcing_dir / f"P.{station_name}.csv").write_text(
-            "date,temp,precip,rel_hum,sw_in,wind_speed\n",
+            "date,temp,precip,rel_hum,sw_in,wind_speed\n" + rows,
             encoding="utf-8",
         )
     forcing_meta_path.parent.mkdir(parents=True)
@@ -247,6 +283,8 @@ def test_preflight_discovers_complete_contract_fixture(tmp_path: Path) -> None:
 
     assert result["status"] == "PREFLIGHT_OK"
     assert result["subdomain_count"] == 8
-    assert result["forcing_station_count"] == 158
+    assert result["forcing_spatial_file_count"] == 163
+    assert result["forcing_station_count"] == 161
+    assert result["forcing_outside_window_count"] == 2
     assert result["snow_station_count"] == 35
     assert result["fsc_scene_count"] == 738

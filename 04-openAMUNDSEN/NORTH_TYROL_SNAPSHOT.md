@@ -5,6 +5,13 @@ North Tyrol setup. It preserves byte-identical selected Fram3S inputs under
 `data_raw/`, writes native-resolution working subsets under `data_working/`
 and creates complete forcing, station and FSC candidate inventories.
 
+For the 2017-09-30 forcing lookback through 2023-09-30 snapshot window, the
+fixed station contract contains 161 stations. Selection first requires a station
+file within the eight-subdomain ROI plus 10 km, then retains every source whose
+timestamp extent overlaps that window. Sources entirely before or after the
+window are excluded; partial per-variable coverage is retained and reported by
+the inventories rather than silently filled.
+
 The builder deliberately writes projects below `projects_pending_events/` with
 empty `assimilation_events` and a `PENDING_EVENTS` marker. Do not move a project
 to `projects/` until its observation events and provisional DA settings have

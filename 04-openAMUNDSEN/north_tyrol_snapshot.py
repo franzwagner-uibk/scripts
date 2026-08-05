@@ -27,7 +27,7 @@ FORCING_BUFFER_M = 10_000.0
 GRID_BUFFER_M = 10_000.0
 FSC_PAD_M = 100.0
 EXPECTED_SUBDOMAINS = 8
-EXPECTED_FORCING_STATIONS = 158
+EXPECTED_FORCING_STATIONS = 161
 EXPECTED_SNOW_STATIONS = 35
 EXPECTED_FSC_COUNTS = {
     2017: 114,
@@ -398,6 +398,29 @@ def _timestamp_column(frame: Any, source: Path) -> str:
     raise ValueError(f"No date/datetime/time column in {source}")
 
 
+def _forcing_source_extent(source: Path) -> tuple[datetime, datetime]:
+    """Return the first and last valid timestamps in one forcing CSV."""
+
+    import pandas as pd
+
+    header = pd.read_csv(source, nrows=0)
+    time_column = _timestamp_column(header, source)
+    values = pd.read_csv(source, usecols=[time_column])[time_column]
+    if values.empty:
+        raise ValueError(f"No forcing timestamps: {source}")
+    timestamps = pd.to_datetime(values, errors="raise")
+    if timestamps.isna().any():
+        raise ValueError(f"Invalid forcing timestamps: {source}")
+    return timestamps.min().to_pydatetime(), timestamps.max().to_pydatetime()
+
+
+def _forcing_data_window(seasons: Sequence[Season]) -> tuple[datetime, datetime]:
+    """Return the forcing selection window, including the model lookback day."""
+
+    data_start, data_end = overall_window(seasons)
+    return data_start - timedelta(days=1), data_end
+
+
 def prepare_forcing(
     sources: SourcePaths,
     raw_root: Path,
@@ -409,31 +432,28 @@ def prepare_forcing(
 ) -> Any:
     """Select, preserve, subset and inventory the single forcing source."""
 
-    import geopandas as gpd
     import pandas as pd
 
     metadata_raw = raw_root / "meteo" / sources.forcing_meta.name
     raw_records.append(copy_verified(sources.forcing_meta, metadata_raw))
-    metadata = gpd.read_file(sources.forcing_meta).to_crs(CRS)
-    required_metadata = {"provider", "stn_name", "stn_name_orig", "elev", "geometry"}
-    missing_metadata = required_metadata - set(metadata.columns)
+    selected, _ = _selected_forcing_metadata(sources, roi_geometry, seasons)
+    required_metadata = {"stn_name_orig", "elev"}
+    missing_metadata = required_metadata - set(selected.columns)
     if missing_metadata:
         raise ValueError(f"Forcing metadata missing columns: {sorted(missing_metadata)}")
-    metadata["id"] = metadata["provider"].astype(str) + "." + metadata["stn_name"].astype(str)
+    metadata = selected
     metadata["name"] = metadata["stn_name_orig"].fillna(metadata["stn_name"]).astype(str)
     metadata["x"] = metadata.geometry.x
     metadata["y"] = metadata.geometry.y
     metadata["alt"] = pd.to_numeric(metadata["elev"], errors="raise")
-    selected = metadata.loc[metadata.geometry.within(roi_geometry.buffer(FORCING_BUFFER_M))].copy()
-    selected = selected.loc[selected["id"].map(lambda station_id: (sources.forcing / f"{station_id}.csv").is_file())]
-    selected = selected.sort_values("id").reset_index(drop=True)
     if len(selected) != EXPECTED_FORCING_STATIONS:
         raise ValueError(
-            f"Expected {EXPECTED_FORCING_STATIONS} forcing stations within ROI + 10 km, got {len(selected)}"
+            f"Expected {EXPECTED_FORCING_STATIONS} forcing stations within ROI + 10 km "
+            f"and the forcing window, got {len(selected)}"
         )
 
-    data_start, data_end = overall_window(seasons)
-    forcing_start = data_start - timedelta(days=1)
+    data_start, _ = overall_window(seasons)
+    forcing_start, data_end = _forcing_data_window(seasons)
     model_times = pd.date_range(data_start, seasons[-1].end, freq="3h")
     network_support = {
         variable: pd.Series(0, index=model_times, dtype="int64")
@@ -455,9 +475,9 @@ def prepare_forcing(
         timestamps = pd.to_datetime(frame[time_column], errors="raise")
         if timestamps.duplicated().any():
             raise ValueError(f"Duplicate forcing timestamps: {source}")
-        missing_variables = set(REQUIRED_FORCING_VARIABLES) - set(frame.columns)
-        if missing_variables:
-            raise ValueError(f"{source} missing forcing variables: {sorted(missing_variables)}")
+        source_variables = set(frame.columns)
+        for variable in set(REQUIRED_FORCING_VARIABLES) - source_variables:
+            frame[variable] = float("nan")
         frame = frame.assign(date=timestamps)
         frame = frame.loc[(frame["date"] >= forcing_start) & (frame["date"] <= data_end)].copy()
         frame = frame.drop(columns=[time_column]) if time_column != "date" else frame
@@ -479,6 +499,7 @@ def prepare_forcing(
                 {
                     "station_id": station_id,
                     "variable": variable,
+                    "source_variable_present": variable in source_variables,
                     "expected_hourly_count": len(in_model_window),
                     "valid_count": int(valid.sum()),
                     "missing_count": int((~valid).sum()),
@@ -504,6 +525,7 @@ def prepare_forcing(
     coverage_fields = (
         "station_id",
         "variable",
+        "source_variable_present",
         "expected_hourly_count",
         "valid_count",
         "missing_count",
@@ -1351,16 +1373,33 @@ def write_pending_projects(root: Path, seasons: Sequence[Season]) -> None:
         )
 
 
-def _selected_forcing_metadata(sources: SourcePaths, roi_geometry: Any) -> Any:
-    """Return the fixed forcing station selection without writing files."""
+def _selected_forcing_metadata(
+    sources: SourcePaths,
+    roi_geometry: Any,
+    seasons: Sequence[Season],
+) -> tuple[Any, int]:
+    """Return spatially eligible forcing stations that overlap the data window."""
 
     import geopandas as gpd
 
     metadata = gpd.read_file(sources.forcing_meta).to_crs(CRS)
+    required_metadata = {"provider", "stn_name", "geometry"}
+    missing_metadata = required_metadata - set(metadata.columns)
+    if missing_metadata:
+        raise ValueError(f"Forcing metadata missing columns: {sorted(missing_metadata)}")
     metadata["id"] = metadata["provider"].astype(str) + "." + metadata["stn_name"].astype(str)
-    selected = metadata.loc[metadata.geometry.within(roi_geometry.buffer(FORCING_BUFFER_M))].copy()
-    selected = selected.loc[selected["id"].map(lambda value: (sources.forcing / f"{value}.csv").is_file())]
-    return selected.sort_values("id").reset_index(drop=True)
+    spatial = metadata.loc[metadata.geometry.within(roi_geometry.buffer(FORCING_BUFFER_M))].copy()
+    spatial = spatial.loc[
+        spatial["id"].map(lambda value: (sources.forcing / f"{value}.csv").is_file())
+    ]
+    spatial = spatial.sort_values("id").reset_index(drop=True)
+    forcing_start, forcing_end = _forcing_data_window(seasons)
+    overlaps = []
+    for station_id in spatial["id"].astype(str):
+        source_start, source_end = _forcing_source_extent(sources.forcing / f"{station_id}.csv")
+        overlaps.append(source_start <= forcing_end and source_end >= forcing_start)
+    selected = spatial.loc[overlaps].reset_index(drop=True)
+    return selected, len(spatial)
 
 
 def preflight(options: SnapshotOptions) -> dict[str, Any]:
@@ -1374,7 +1413,9 @@ def preflight(options: SnapshotOptions) -> dict[str, Any]:
     if len(subdomains) != EXPECTED_SUBDOMAINS:
         raise ValueError(f"Expected {EXPECTED_SUBDOMAINS} subdomains, got {len(subdomains)}")
     roi_geometry = subdomains.geometry.buffer(0).unary_union
-    forcing = _selected_forcing_metadata(sources, roi_geometry)
+    forcing, forcing_spatial_file_count = _selected_forcing_metadata(
+        sources, roi_geometry, seasons
+    )
     if len(forcing) != EXPECTED_FORCING_STATIONS:
         raise ValueError(f"Expected {EXPECTED_FORCING_STATIONS} forcing stations, got {len(forcing)}")
     snow_metadata = __import__("pandas").read_csv(sources.snow / "stations_snow_depth.csv")
@@ -1406,7 +1447,9 @@ def preflight(options: SnapshotOptions) -> dict[str, Any]:
         "resolution": options.resolution,
         "seasons": [asdict(season) | {"name": season.name} for season in seasons],
         "subdomain_count": len(subdomains),
+        "forcing_spatial_file_count": forcing_spatial_file_count,
         "forcing_station_count": len(forcing),
+        "forcing_outside_window_count": forcing_spatial_file_count - len(forcing),
         "snow_station_count": len(snow),
         "fsc_scene_count": len(scenes),
         "fsc_counts_by_start_year": counts,
