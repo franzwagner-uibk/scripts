@@ -213,6 +213,7 @@ def test_finalizer_failure_leaves_canonical_tree_and_marks_staging_incomplete(
         "_write_station_roles",
         "_promote_project_configs",
         "_write_scheduler_inventories",
+        "_prepare_partitioned_regions",
     ):
         monkeypatch.setattr(finalizer, function_name, lambda *_args, **_kwargs: None)
     monkeypatch.setattr(

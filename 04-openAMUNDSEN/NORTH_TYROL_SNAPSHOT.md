@@ -62,6 +62,12 @@ projects, prepares all eight subdomains per project and validates their steps.
 It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
 
+The accepted source polygons contain small overlaps that v0.9.4 correctly
+refuses. The adapter leaves the hashed working GeoPackage unchanged and derives
+a preparation-only partition in sorted subdomain-ID order. It removes overlap
+from later polygons while preserving the exact union, then records source and
+output hashes and removed areas under `provenance/`.
+
 openAMUNDSEN-DA v0.9.4 separates subdomain-tree preparation from the
 observation/step preparation normally entered by `subdomains run`. The adapter
 runs the official `subdomains prepare` CLI and then invokes that exact pinned
