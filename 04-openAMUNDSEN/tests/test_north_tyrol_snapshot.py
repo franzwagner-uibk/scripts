@@ -20,6 +20,7 @@ from north_tyrol_snapshot import (  # noqa: E402
     AsciiGridHeader,
     SnapshotOptions,
     _cropped_geotransform,
+    _date_first,
     _forcing_source_extent,
     _validated_geotransform,
     ascii_crop_window,
@@ -165,6 +166,16 @@ def test_forcing_source_extent_rejects_missing_or_empty_timestamps(
 
     with pytest.raises(ValueError, match="column|timestamps"):
         _forcing_source_extent(source)
+
+
+def test_forcing_working_frame_places_normalized_date_first() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame({"temp": [273.15], "precip": [0.0], "date": ["2017-10-01"]})
+
+    ordered = _date_first(frame, Path("station.csv"))
+
+    assert ordered.columns.tolist() == ["date", "temp", "precip"]
 
 
 def test_project_configuration_is_pending_and_uses_correct_fsc_classes() -> None:

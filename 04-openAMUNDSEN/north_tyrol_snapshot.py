@@ -421,6 +421,15 @@ def _forcing_data_window(seasons: Sequence[Season]) -> tuple[datetime, datetime]
     return data_start - timedelta(days=1), data_end
 
 
+def _date_first(frame: Any, source: Path) -> Any:
+    """Return a station frame with the reader-required date column first."""
+
+    if "date" not in frame.columns:
+        raise ValueError(f"Working forcing frame lacks date column: {source}")
+    columns = ["date", *(column for column in frame.columns if column != "date")]
+    return frame.loc[:, columns]
+
+
 def prepare_forcing(
     sources: SourcePaths,
     raw_root: Path,
@@ -481,6 +490,7 @@ def prepare_forcing(
         frame = frame.assign(date=timestamps)
         frame = frame.loc[(frame["date"] >= forcing_start) & (frame["date"] <= data_end)].copy()
         frame = frame.drop(columns=[time_column]) if time_column != "date" else frame
+        frame = _date_first(frame, source)
         if frame.empty:
             raise ValueError(f"No forcing data in snapshot window: {source}")
         frame = frame.sort_values("date")
