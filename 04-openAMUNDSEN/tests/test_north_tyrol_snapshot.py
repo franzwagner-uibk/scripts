@@ -19,7 +19,9 @@ from north_tyrol_snapshot import (  # noqa: E402
     PINNED_IMAGE,
     AsciiGridHeader,
     SnapshotOptions,
+    _cropped_geotransform,
     _forcing_source_extent,
+    _validated_geotransform,
     ascii_crop_window,
     classify_fsc,
     copy_verified,
@@ -90,6 +92,37 @@ def test_ascii_crop_preserves_original_numeric_tokens(tmp_path: Path) -> None:
 
     assert destination.read_text(encoding="utf-8").splitlines()[6:] == ["2.00 3.0", "6 7"]
     assert record["window"] == [0, 2, 1, 3]
+
+
+def test_dataset_level_geotransform_is_validated_and_updated_for_crop() -> None:
+    import xarray as xr
+
+    dataset = xr.Dataset(
+        {"spatial_ref": xr.DataArray(0)},
+        coords={"x": [573025.0, 573075.0, 573125.0], "y": [5308625.0, 5308575.0]},
+        attrs={"GeoTransform": "50 0 573000 0 -50 5308650 0 0 1"},
+    )
+
+    style = _validated_geotransform(dataset, Path("scene.nc"))
+    cropped = dataset.isel(x=slice(1, None))
+
+    assert style == 9
+    assert _cropped_geotransform(cropped, style) == (
+        "50 0 573050 0 -50 5308650 0 0 1"
+    )
+
+
+def test_geotransform_coordinate_mismatch_is_rejected() -> None:
+    import xarray as xr
+
+    dataset = xr.Dataset(
+        {"spatial_ref": xr.DataArray(0)},
+        coords={"x": [573025.0, 573075.0], "y": [5308625.0, 5308575.0]},
+        attrs={"GeoTransform": "50 0 0 0 -50 0 0 0 1"},
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        _validated_geotransform(dataset, Path("scene.nc"))
 
 
 def test_raw_copy_hash_linkage(tmp_path: Path) -> None:

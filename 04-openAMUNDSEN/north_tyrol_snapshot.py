@@ -816,6 +816,77 @@ def _coordinate_slice(values: Any, minimum: float, maximum: float) -> slice:
     return slice(minimum, maximum) if values[0] < values[-1] else slice(maximum, minimum)
 
 
+def _geotransform_values(value: Any, source: Path) -> tuple[tuple[float, ...], int]:
+    """Normalize a six-value GDAL or nine-value affine GeoTransform."""
+
+    if isinstance(value, str):
+        parts = value.replace(",", " ").split()
+    else:
+        parts = list(value)
+    try:
+        values = tuple(float(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid GeoTransform metadata: {source}") from exc
+    if len(values) == 6:
+        x_origin, x_step, x_rotation, y_origin, y_rotation, y_step = values
+        return (x_origin, x_step, x_rotation, y_origin, y_rotation, y_step), 6
+    if len(values) == 9:
+        x_step, x_rotation, x_origin, y_rotation, y_step, y_origin, *tail = values
+        if tail != [0.0, 0.0, 1.0]:
+            raise ValueError(f"Unsupported affine GeoTransform metadata: {source}")
+        return (x_origin, x_step, x_rotation, y_origin, y_rotation, y_step), 9
+    raise ValueError(f"GeoTransform must contain six or nine values: {source}")
+
+
+def _validated_geotransform(dataset: Any, source: Path) -> int:
+    """Validate source GeoTransform metadata against native x/y coordinates."""
+
+    import numpy as np
+
+    candidates = [
+        dataset["spatial_ref"].attrs.get("GeoTransform"),
+        dataset.attrs.get("GeoTransform"),
+    ]
+    value = next((candidate for candidate in candidates if candidate is not None), None)
+    if value is None:
+        raise ValueError(f"SCF scene lacks GeoTransform metadata: {source}")
+    transform, style = _geotransform_values(value, source)
+    x_origin, x_step, x_rotation, y_origin, y_rotation, y_step = transform
+    x = np.asarray(dataset["x"].values, dtype=float)
+    y = np.asarray(dataset["y"].values, dtype=float)
+    if len(x) < 2 or len(y) < 2:
+        raise ValueError(f"SCF scene has insufficient raster coordinates: {source}")
+    checks = (
+        np.allclose(np.diff(x), x_step),
+        np.allclose(np.diff(y), y_step),
+        np.isclose(x[0], x_origin + x_step / 2.0),
+        np.isclose(y[0], y_origin + y_step / 2.0),
+        np.isclose(x_rotation, 0.0),
+        np.isclose(y_rotation, 0.0),
+    )
+    if not all(checks):
+        raise ValueError(f"SCF GeoTransform does not match x/y coordinates: {source}")
+    return style
+
+
+def _cropped_geotransform(dataset: Any, style: int) -> str:
+    """Return GeoTransform metadata for a native aligned spatial subset."""
+
+    x = dataset["x"].values
+    y = dataset["y"].values
+    x_step = float(x[1] - x[0])
+    y_step = float(y[1] - y[0])
+    x_origin = float(x[0] - x_step / 2.0)
+    y_origin = float(y[0] - y_step / 2.0)
+    if style == 6:
+        values = (x_origin, x_step, 0.0, y_origin, 0.0, y_step)
+    elif style == 9:
+        values = (x_step, 0.0, x_origin, 0.0, y_step, y_origin, 0.0, 0.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported GeoTransform style: {style}")
+    return " ".join(f"{value:.15g}" for value in values)
+
+
 def discover_fsc_scenes(sources: SourcePaths, seasons: Sequence[Season]) -> list[tuple[date, Path]]:
     """Discover all unique SCF scenes in the requested hydrological windows."""
 
@@ -880,14 +951,16 @@ def prepare_fsc(
             crs_text = spatial_attrs.get("crs_wkt") or spatial_attrs.get("spatial_ref")
             if not crs_text or pyproj.CRS.from_user_input(crs_text).to_epsg() != 25832:
                 raise ValueError(f"SCF scene is not EPSG:25832: {source}")
-            if "GeoTransform" not in spatial_attrs:
-                raise ValueError(f"SCF scene lacks GeoTransform metadata: {source}")
+            geotransform_style = _validated_geotransform(dataset, source)
             subset = dataset.sel(
                 x=_coordinate_slice(dataset["x"].values, min_x - FSC_PAD_M, max_x + FSC_PAD_M),
                 y=_coordinate_slice(dataset["y"].values, min_y - FSC_PAD_M, max_y + FSC_PAD_M),
             ).load()
             if subset.sizes.get("x", 0) < 2 or subset.sizes.get("y", 0) < 2:
                 raise ValueError(f"Empty FSC crop: {source}")
+            subset.attrs["GeoTransform"] = _cropped_geotransform(
+                subset, geotransform_style
+            )
             for variable in ("fsc", "uncertainty"):
                 subset[variable].attrs["grid_mapping"] = "spatial_ref"
             output = working_root / "obs" / "snowcover" / source.name
@@ -959,6 +1032,8 @@ def prepare_fsc(
                 "date": scene_date.isoformat(),
                 "source": str(source),
                 "source_sha256": raw_record["sha256"],
+                "source_geotransform_style": geotransform_style,
+                "working_geotransform": subset.attrs["GeoTransform"],
                 "working": str(output),
                 "working_sha256": sha256_file(output),
             }

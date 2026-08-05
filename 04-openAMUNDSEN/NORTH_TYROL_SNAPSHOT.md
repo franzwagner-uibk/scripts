@@ -12,6 +12,11 @@ timestamp extent overlaps that window. Sources entirely before or after the
 window are excluded; partial per-variable coverage is retained and reported by
 the inventories rather than silently filled.
 
+EURAC GeoTransform metadata is accepted from either the CF grid-mapping
+variable or the NetCDF dataset attributes. It must match the native x/y
+coordinates exactly; each lossless crop receives a correspondingly shifted
+GeoTransform and is never resampled.
+
 The builder deliberately writes projects below `projects_pending_events/` with
 empty `assimilation_events` and a `PENDING_EVENTS` marker. Do not move a project
 to `projects/` until its observation events and provisional DA settings have
