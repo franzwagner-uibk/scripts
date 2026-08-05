@@ -68,6 +68,11 @@ a preparation-only partition in sorted subdomain-ID order. It removes overlap
 from later polygons while preserving the exact union, then records source and
 output hashes and removed areas under `provenance/`.
 
+Recorded files under `data_working/` remain byte-identical. Final station roles
+live in `data_finalized/obs/stations/`, which links to the immutable station
+series and contains only the finalized role metadata as a new file. Project
+configs reference this finalized layer; preparation copies its spatial subset.
+
 openAMUNDSEN-DA v0.9.4 separates subdomain-tree preparation from the
 observation/step preparation normally entered by `subdomains run`. The adapter
 runs the official `subdomains prepare` CLI and then invokes that exact pinned
