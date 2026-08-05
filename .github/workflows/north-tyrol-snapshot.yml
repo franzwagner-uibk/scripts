@@ -5,18 +5,30 @@ on:
     paths:
       - .github/workflows/north-tyrol-snapshot.yml
       - 04-openAMUNDSEN/buildNorthTyrolSnapshot.py
+      - 04-openAMUNDSEN/da_event_scheduler.py
+      - 04-openAMUNDSEN/finalizeNorthTyrolProjects.py
       - 04-openAMUNDSEN/north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml
+      - 04-openAMUNDSEN/scheduleDAEvents.py
+      - 04-openAMUNDSEN/tests/test_da_event_scheduler.py
       - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
       - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
+      - docs/superpowers/specs/2026-08-05-da-event-scheduler-finalization-design.md
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
   push:
     branches: [main]
     paths:
       - .github/workflows/north-tyrol-snapshot.yml
       - 04-openAMUNDSEN/buildNorthTyrolSnapshot.py
+      - 04-openAMUNDSEN/da_event_scheduler.py
+      - 04-openAMUNDSEN/finalizeNorthTyrolProjects.py
       - 04-openAMUNDSEN/north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml
+      - 04-openAMUNDSEN/scheduleDAEvents.py
+      - 04-openAMUNDSEN/tests/test_da_event_scheduler.py
       - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
       - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
+      - docs/superpowers/specs/2026-08-05-da-event-scheduler-finalization-design.md
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
 
 permissions:
@@ -43,4 +55,5 @@ jobs:
             --workdir /work \
             ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
             python -m pytest -q -p no:cacheprovider \
-              04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
+              04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py \
+              04-openAMUNDSEN/tests/test_da_event_scheduler.py
