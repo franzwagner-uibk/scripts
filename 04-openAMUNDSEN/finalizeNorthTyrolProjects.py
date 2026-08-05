@@ -513,7 +513,15 @@ def _relativize_internal_symlinks(root: Path) -> None:
 
     root = root.resolve()
     for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_symlink()):
-        target = path.resolve(strict=True)
+        raw_target = Path(os.readlink(path))
+        if raw_target.is_absolute():
+            try:
+                target = root / raw_target.relative_to("/setup")
+            except ValueError as exc:
+                raise ValueError(f"Prepared symlink has an unknown absolute root: {path} -> {raw_target}") from exc
+            target = target.resolve(strict=True)
+        else:
+            target = (path.parent / raw_target).resolve(strict=True)
         try:
             target.relative_to(root)
         except ValueError as exc:
