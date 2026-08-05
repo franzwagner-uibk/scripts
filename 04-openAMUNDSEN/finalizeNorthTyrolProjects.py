@@ -243,8 +243,16 @@ def _preserve_parent_provenance(staging: Path, initial: Mapping[str, Any]) -> No
 
 
 def _write_station_roles(staging: Path, roles: StationRoleResult) -> None:
-    path = staging / "data_working" / "obs" / "stations" / "stations_da_metadata.csv"
-    existing = read_csv_records(path)
+    source_dir = staging / "data_working" / "obs" / "stations"
+    source_metadata = source_dir / "stations_da_metadata.csv"
+    finalized_dir = staging / "data_finalized" / "obs" / "stations"
+    finalized_dir.mkdir(parents=True, exist_ok=False)
+    for source in sorted(path for path in source_dir.iterdir() if path.is_file()):
+        if source.name == source_metadata.name:
+            continue
+        target = finalized_dir / source.name
+        target.symlink_to(os.path.relpath(source, start=target.parent))
+    existing = read_csv_records(source_metadata)
     role_by_id = {str(row["station_id"]): row for row in roles.roles}
     if set(role_by_id) != {str(row["station_id"]) for row in existing}:
         raise ValueError("Station role IDs differ from stations_da_metadata.csv")
@@ -260,7 +268,7 @@ def _write_station_roles(staging: Path, roles: StationRoleResult) -> None:
                 "status": f"final_{role['role']}",
             }
         )
-    _write_csv(path, updated)
+    _write_csv(finalized_dir / source_metadata.name, updated)
 
 
 def _promote_project_configs(staging: Path, schedules: Mapping[str, ScheduleResult]) -> None:
@@ -274,6 +282,7 @@ def _promote_project_configs(staging: Path, schedules: Mapping[str, ScheduleResu
         yaml_path = target / f"{project_name}.yml"
         project = _read_yaml(yaml_path)
         da = project["data_assimilation"]
+        project["obs"]["stations"]["dir"] = "data_finalized/obs/stations"
         da["prior_forcing"]["ensemble_size"] = 50
         da["output"]["retention"] = "compact"
         event_filter = da["subdomain_event_filter"]

@@ -208,6 +208,40 @@ def test_container_rooted_symlinks_become_internal_relative_links(tmp_path: Path
     finalizer._validate_internal_symlinks(root)
 
 
+def test_station_role_layer_preserves_recorded_working_metadata(tmp_path: Path) -> None:
+    working = tmp_path / "data_working" / "obs" / "stations"
+    working.mkdir(parents=True)
+    source_metadata = working / "stations_da_metadata.csv"
+    original = (
+        "station_id,use_for_da,use_for_benchmark,status\n"
+        "a,True,True,provisional_pending_event_selection\n"
+    )
+    source_metadata.write_text(original, encoding="utf-8")
+    (working / "a.csv").write_text("time,snow_depth\n", encoding="utf-8")
+    roles = StationRoleResult(
+        (
+            {
+                "station_id": "a",
+                "role": "holdout",
+                "use_for_da": False,
+                "use_for_benchmark": True,
+            },
+        ),
+        (),
+    )
+
+    finalizer._write_station_roles(tmp_path, roles)
+
+    finalized = tmp_path / "data_finalized" / "obs" / "stations"
+    assert source_metadata.read_text(encoding="utf-8") == original
+    assert (finalized / "a.csv").is_symlink()
+    finalized_role = finalizer.read_csv_records(finalized / "stations_da_metadata.csv")[0]
+    assert finalized_role["station_id"] == "a"
+    assert finalized_role["status"] == "final_holdout"
+    assert finalized_role["use_for_da"] == "False"
+    assert finalized_role["use_for_benchmark"] == "True"
+
+
 def test_finalizer_failure_leaves_canonical_tree_and_marks_staging_incomplete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
