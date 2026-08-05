@@ -25,6 +25,62 @@ empty `assimilation_events` and a `PENDING_EVENTS` marker. Do not move a project
 to `projects/` until its observation events and provisional DA settings have
 been reviewed.
 
+## Event scheduling and finalization
+
+`scheduleDAEvents.py` is the generic interface to the pure normalized-table
+scheduler in `da_event_scheduler.py`. The North Tyrol policy is versioned at
+`policies/north_tyrol_alternating_6day_v1.yml`. It uses alternating FSC and
+station-HS targets every six days from October 7 through July 31, deterministic
+observation matching, a 20% FSC cloud threshold and a shared elevation-aware
+station split.
+
+The fixed targets are not moved. FSC and station observations are matched
+within four days so retained adjacent slots can satisfy the five-to-seven-day
+gap contract despite irregular acquisitions. A missing slot remains an explicit
+exception and does not alter later slot types. Each observation type must fill
+at least 85% of its 25 annual targets.
+
+To inspect a normalized inventory without creating output:
+
+```bash
+python 04-openAMUNDSEN/scheduleDAEvents.py \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml \
+  --fsc-inventory SNAPSHOT/inventories/fsc_scene_subdomain_quality.csv \
+  --snow-inventory SNAPSHOT/inventories/snow_station_daily_support.csv \
+  --station-metadata SNAPSHOT/data_working/obs/stations/stations_snow_depth.csv \
+  --start 2022-10-01 \
+  --end 2023-09-30 \
+  --output-dir /unused/in/preflight \
+  --preflight
+```
+
+`finalizeNorthTyrolProjects.py` is the snapshot-specific adapter. Preflight
+verifies the accepted pending state, all recorded raw and working hashes, the
+schedule and the pinned image contract without writing. Normal execution copies
+the full snapshot to a timestamped sibling, creates the ES50 compact-retention
+projects, prepares all eight subdomains per project and validates their steps.
+It swaps the sibling into the canonical path only after acceptance and restores
+the original on any post-swap failure.
+
+openAMUNDSEN-DA v0.9.4 separates subdomain-tree preparation from the
+observation/step preparation normally entered by `subdomains run`. The adapter
+runs the official `subdomains prepare` CLI and then invokes that exact pinned
+v0.9.4 preparation routine for each subdomain without entering propagation.
+Any `results`, restart state or model artifact fails final acceptance.
+
+```bash
+python 04-openAMUNDSEN/finalizeNorthTyrolProjects.py \
+  --setup-root /home/franz/workspace/openamundsen_da_runs/north_tyrol_subdomain_runs/north_tyrol_hydro_2017_2023_snapshot_v1 \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml \
+  --image ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
+  --preflight
+```
+
+Remove `--preflight` only from a clean reviewed scripts commit. When Git is not
+available to the finalizer runtime, set `NORTH_TYROL_FINALIZER_COMMIT` to the
+exact reviewed 40-character Git commit. The final state is `READY_TO_RUN`; ES50
+model execution is deliberately a separate approval gate.
+
 ## P8 preflight
 
 Run inside the pinned openAMUNDSEN-DA image with Fram3S mounted read-only:
@@ -59,5 +115,7 @@ docker run --rm \
   -v /home/franz/workspace/repos/scripts:/work:ro \
   -w /work \
   ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
-  python -m pytest -q 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
+  python -m pytest -q -p no:cacheprovider \
+    04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py \
+    04-openAMUNDSEN/tests/test_da_event_scheduler.py
 ```

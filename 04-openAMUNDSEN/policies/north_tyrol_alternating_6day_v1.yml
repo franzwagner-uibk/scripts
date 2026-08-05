@@ -1,0 +1,35 @@
+schema_version: 1
+
+cadence:
+  mode: fixed_day
+  target_spacing_days: 6
+  accepted_adjacent_gap_days:
+    min: 5
+    max: 7
+  sequence: [scf, station_hs]
+  interval_start: 10-07
+  interval_end: 07-31
+  retain_skipped_slots: true
+
+fsc:
+  search_window_days: 4
+  maximum_cloud_fraction: 0.20
+  admission: at_least_one_subdomain
+  filter_observed_snow_fraction: false
+  holdouts: false
+
+station_hs:
+  # Symmetric matching is required to preserve the 5--7 day inter-event gap
+  # around irregular station availability while keeping the fixed targets.
+  search_window_days: 4
+  shared_split_across_projects: true
+  holdouts:
+    domains_with_at_least_4_stations: 2
+    domains_with_2_or_3_stations: 1
+    domains_with_1_station: 0
+    priority: [temporal_coverage, elevation_spread, station_id]
+    preserve_da_support: true
+    allow_recorded_reduction: true
+
+fulfillment:
+  minimum_fraction_per_type: 0.85
