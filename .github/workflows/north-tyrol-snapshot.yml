@@ -1,0 +1,46 @@
+name: North Tyrol snapshot tests
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/north-tyrol-snapshot.yml
+      - 04-openAMUNDSEN/buildNorthTyrolSnapshot.py
+      - 04-openAMUNDSEN/north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
+      - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/north-tyrol-snapshot.yml
+      - 04-openAMUNDSEN/buildNorthTyrolSnapshot.py
+      - 04-openAMUNDSEN/north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
+      - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
+
+permissions:
+  contents: read
+
+jobs:
+  north-tyrol-snapshot-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run targeted snapshot tests
+        run: |
+          docker run --rm \
+            --read-only \
+            --network none \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g \
+            --volume "${GITHUB_WORKSPACE}:/work:ro" \
+            --workdir /work \
+            ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
+            python -m pytest -q -p no:cacheprovider \
+              04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
