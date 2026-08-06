@@ -1431,8 +1431,8 @@ MAPS_YAML = """maps:
         station_match_tolerance_m: 10
         show_stations_name: false
         show_stations_elev: false
-        legend_items:
-          - {kind: station_categories, placement: inside, anchor: top_left}
+        below_items:
+          - {kind: station_categories}
       - {row: 0, col: 2, kind: dem, title: Elevation}
       - {row: 1, col: 0, kind: landcover, title: Land cover}
       - {row: 1, col: 1, kind: hillshade, title: Terrain shading, show_station_marker: true, station_marker_mode: sources_and_roles, station_match_tolerance_m: 10, show_stations_name: false}

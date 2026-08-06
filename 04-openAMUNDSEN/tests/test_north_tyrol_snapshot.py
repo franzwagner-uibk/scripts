@@ -49,9 +49,7 @@ def test_north_tyrol_map_template_enables_classified_station_overview() -> None:
     assert "roi_label" not in panels[0]
     assert panels[1]["station_marker_mode"] == "sources_and_roles"
     assert panels[1]["station_match_tolerance_m"] == 10
-    assert panels[1]["legend_items"] == [
-        {"kind": "station_categories", "placement": "inside", "anchor": "top_left"}
-    ]
+    assert panels[1]["below_items"] == [{"kind": "station_categories"}]
     assert panels[4]["station_marker_mode"] == "sources_and_roles"
 
 
