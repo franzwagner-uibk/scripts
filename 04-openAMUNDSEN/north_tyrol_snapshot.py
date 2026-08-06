@@ -1421,18 +1421,21 @@ MAPS_YAML = """maps:
     defaults:
       show_scalebar: true
     panels:
-      - {row: 0, col: 0, kind: overview, title: Overview, scale: 2500000, roi_label: Subdomain ROI}
+      - {row: 0, col: 0, kind: overview, title: Overview, scale: 2500000, show_subdomain_labels: true}
       - row: 0
         col: 1
         kind: roi
         title: ROI and stations
         show_station_marker: true
+        station_marker_mode: sources_and_roles
+        station_match_tolerance_m: 10
         show_stations_name: false
         show_stations_elev: false
-        below_items: [{kind: station_symbol, label: Meteo and snow stations}]
+        legend_items:
+          - {kind: station_categories, placement: inside, anchor: top_left}
       - {row: 0, col: 2, kind: dem, title: Elevation}
       - {row: 1, col: 0, kind: landcover, title: Land cover}
-      - {row: 1, col: 1, kind: hillshade, title: Terrain shading, show_station_marker: true, show_stations_name: false}
+      - {row: 1, col: 1, kind: hillshade, title: Terrain shading, show_station_marker: true, station_marker_mode: sources_and_roles, station_match_tolerance_m: 10, show_stations_name: false}
       - {row: 1, col: 2, kind: srf, title: Snow redistribution factor, show_hillshade: true}
 """
 

@@ -217,6 +217,11 @@ def test_station_role_layer_preserves_recorded_working_metadata(tmp_path: Path) 
         "a,True,True,provisional_pending_event_selection\n"
     )
     source_metadata.write_text(original, encoding="utf-8")
+    (working / "stations_snow_depth.csv").write_text(
+        "id,name,x,y,alt\n"
+        "a,Station A,100.0,200.0,1500.0\n",
+        encoding="utf-8",
+    )
     (working / "a.csv").write_text("time,snow_depth\n", encoding="utf-8")
     roles = StationRoleResult(
         (
@@ -240,6 +245,11 @@ def test_station_role_layer_preserves_recorded_working_metadata(tmp_path: Path) 
     assert finalized_role["status"] == "final_holdout"
     assert finalized_role["use_for_da"] == "False"
     assert finalized_role["use_for_benchmark"] == "True"
+    assert finalized_role["id"] == "a"
+    assert finalized_role["name"] == "Station A"
+    assert finalized_role["x"] == "100.0"
+    assert finalized_role["y"] == "200.0"
+    assert finalized_role["alt"] == "1500.0"
 
 
 def test_finalizer_failure_leaves_canonical_tree_and_marks_staging_incomplete(
