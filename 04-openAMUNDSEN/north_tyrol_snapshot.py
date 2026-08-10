@@ -1333,6 +1333,7 @@ def project_configuration(season: Season) -> dict[str, Any]:
                     "sigma_floor": 0.05,
                     "sigma_cloud_scale": 0.1,
                     "min_sigma": 0.03,
+                    "min_support_coverage_ratio": 0.1,
                 }
             },
             "uncertainty": {
@@ -1366,7 +1367,6 @@ def project_configuration(season: Season) -> dict[str, Any]:
                 "sigma_rh": 0.5,
                 "sigma_sw": 0.05,
                 "seed": 42,
-                "rebase_open_loop": False,
             },
             "restart": {"dump_state": True, "state_pattern": "model_state.pickle.gz"},
             "output": {
