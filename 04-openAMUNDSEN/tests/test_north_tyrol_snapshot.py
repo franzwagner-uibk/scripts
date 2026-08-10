@@ -16,6 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from north_tyrol_snapshot import (  # noqa: E402
+    MAPS_YAML,
     PINNED_IMAGE,
     AsciiGridHeader,
     SnapshotOptions,
@@ -38,6 +39,18 @@ from north_tyrol_snapshot import (  # noqa: E402
     write_json,
     write_pending_projects,
 )
+
+
+def test_north_tyrol_map_template_enables_classified_station_overview() -> None:
+    config = YAML(typ="safe").load(MAPS_YAML)
+    panels = config["maps"]["subdomain_example_setup_overview"]["panels"]
+
+    assert panels[0]["show_subdomain_labels"] is True
+    assert "roi_label" not in panels[0]
+    assert panels[1]["station_marker_mode"] == "sources_and_roles"
+    assert panels[1]["station_match_tolerance_m"] == 10
+    assert panels[1]["below_items"] == [{"kind": "station_categories"}]
+    assert panels[4]["station_marker_mode"] == "sources_and_roles"
 
 
 def test_hydrological_seasons_include_complete_leap_year_window() -> None:

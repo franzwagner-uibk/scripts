@@ -245,6 +245,7 @@ def _preserve_parent_provenance(staging: Path, initial: Mapping[str, Any]) -> No
 def _write_station_roles(staging: Path, roles: StationRoleResult) -> None:
     source_dir = staging / "data_working" / "obs" / "stations"
     source_metadata = source_dir / "stations_da_metadata.csv"
+    source_coordinates = source_dir / "stations_snow_depth.csv"
     finalized_dir = staging / "data_finalized" / "obs" / "stations"
     finalized_dir.mkdir(parents=True, exist_ok=False)
     for source in sorted(path for path in source_dir.iterdir() if path.is_file()):
@@ -253,16 +254,25 @@ def _write_station_roles(staging: Path, roles: StationRoleResult) -> None:
         target = finalized_dir / source.name
         target.symlink_to(os.path.relpath(source, start=target.parent))
     existing = read_csv_records(source_metadata)
+    coordinates_by_id = {str(row["id"]): row for row in read_csv_records(source_coordinates)}
     role_by_id = {str(row["station_id"]): row for row in roles.roles}
     if set(role_by_id) != {str(row["station_id"]) for row in existing}:
         raise ValueError("Station role IDs differ from stations_da_metadata.csv")
+    if set(role_by_id) != set(coordinates_by_id):
+        raise ValueError("Station coordinate IDs differ from stations_da_metadata.csv")
     updated = []
     for row in existing:
         station_id = str(row["station_id"])
         role = role_by_id[station_id]
+        coordinates = coordinates_by_id[station_id]
         updated.append(
             {
                 **row,
+                "id": coordinates["id"],
+                "name": coordinates["name"],
+                "x": coordinates["x"],
+                "y": coordinates["y"],
+                "alt": coordinates["alt"],
                 "use_for_da": role["use_for_da"],
                 "use_for_benchmark": role["use_for_benchmark"],
                 "status": f"final_{role['role']}",
