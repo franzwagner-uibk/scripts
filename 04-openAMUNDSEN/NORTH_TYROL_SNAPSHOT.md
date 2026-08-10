@@ -11,6 +11,9 @@ file within the eight-subdomain ROI plus 10 km, then retains every source whose
 timestamp extent overlaps that window. Sources entirely before or after the
 window are excluded; partial per-variable coverage is retained and reported by
 the inventories rather than silently filled.
+The shared openAMUNDSEN output configuration keeps those 161 forcing points and
+adds the 35 selected snow stations under their independent station IDs. Duplicate
+coordinates are valid, but duplicate point names fail snapshot generation.
 Working station files end at the last native source timestamp aligned with the
 3 h model grid. Any later incomplete off-grid tail rows are omitted and counted
 explicitly in the forcing coverage inventory; they are not aggregated or filled.

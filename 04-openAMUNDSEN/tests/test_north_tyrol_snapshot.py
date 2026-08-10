@@ -230,7 +230,8 @@ def test_setup_configuration_parses_with_pinned_openamundsen() -> None:
     import pandas as pd
 
     stations = pd.DataFrame([{"id": "P.S000", "x": 100.0, "y": 200.0}])
-    config = setup_configuration(stations, hydrological_seasons(2017, 2022))
+    snow_stations = pd.DataFrame([{"id": "04140864", "x": 100.0, "y": 200.0}])
+    config = setup_configuration(stations, snow_stations, hydrological_seasons(2017, 2022))
     grid_variables = config["output_data"]["grids"]["variables"]
 
     assert {"var": "snow.depth", "name": "snowdepth_instantaneous"} in grid_variables
@@ -239,6 +240,49 @@ def test_setup_configuration_parses_with_pinned_openamundsen() -> None:
 
     assert parsed.start_date == datetime(2017, 10, 1, 0, 0)
     assert parsed.end_date == datetime(2023, 9, 30, 21, 0)
+
+
+def test_setup_configuration_keeps_forcing_and_snow_station_identities() -> None:
+    import pandas as pd
+
+    forcing_stations = pd.DataFrame(
+        [
+            {"id": f"forcing_{index:03d}", "x": float(index), "y": 1.0}
+            for index in range(161)
+        ]
+    )
+    snow_stations = pd.DataFrame(
+        [
+            {"id": f"{index:08d}", "x": 0.0, "y": 1.0}
+            for index in range(35)
+        ]
+    )
+
+    config = setup_configuration(
+        forcing_stations,
+        snow_stations,
+        hydrological_seasons(2017, 2022),
+    )
+    points = config["output_data"]["timeseries"]["points"]
+
+    assert len(points) == 196
+    assert len({point["name"] for point in points}) == 196
+    assert {point["name"] for point in points} >= {"forcing_000", "00000000"}
+    assert sum(point["x"] == 0.0 and point["y"] == 1.0 for point in points) == 36
+
+
+def test_setup_configuration_rejects_duplicate_point_names() -> None:
+    import pandas as pd
+
+    forcing_stations = pd.DataFrame([{"id": "shared", "x": 1.0, "y": 2.0}])
+    snow_stations = pd.DataFrame([{"id": "SHARED", "x": 3.0, "y": 4.0}])
+
+    with pytest.raises(ValueError, match="Duplicate output point names"):
+        setup_configuration(
+            forcing_stations,
+            snow_stations,
+            hydrological_seasons(2017, 2022),
+        )
 
 
 def test_pending_projects_have_no_active_project_tree(tmp_path: Path) -> None:
