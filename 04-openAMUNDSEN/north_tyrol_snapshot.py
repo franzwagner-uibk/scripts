@@ -1126,13 +1126,30 @@ def dump_yaml(path: Path, value: dict[str, Any]) -> None:
         yaml.dump(value, file_obj)
 
 
-def setup_configuration(forcing_stations: Any, seasons: Sequence[Season]) -> dict[str, Any]:
+def setup_configuration(
+    forcing_stations: Any,
+    snow_stations: Any,
+    seasons: Sequence[Season],
+) -> dict[str, Any]:
     """Return the shared six-season openAMUNDSEN setup configuration."""
 
-    points = [
+    forcing_points = [
         {"x": float(row.x), "y": float(row.y), "name": str(row.id)}
         for row in forcing_stations.sort_values("id").itertuples(index=False)
     ]
+    snow_points = [
+        {"x": float(row.x), "y": float(row.y), "name": str(row.id)}
+        for row in snow_stations.sort_values("id").itertuples(index=False)
+    ]
+    points = [*forcing_points, *snow_points]
+    normalized_names = [str(point["name"]).strip().lower() for point in points]
+    if any(not name for name in normalized_names):
+        raise ValueError("Output point names must not be empty")
+    duplicate_names = sorted(
+        {name for name in normalized_names if normalized_names.count(name) > 1}
+    )
+    if duplicate_names:
+        raise ValueError(f"Duplicate output point names: {', '.join(duplicate_names)}")
     start = seasons[0].start
     end = seasons[-1].end
     return {
@@ -1712,7 +1729,7 @@ def build_snapshot(options: SnapshotOptions) -> Path:
             seasons,
             raw_records,
         )
-        prepare_snow_observations(
+        snow_stations = prepare_snow_observations(
             sources,
             raw_root,
             working_root,
@@ -1733,7 +1750,10 @@ def build_snapshot(options: SnapshotOptions) -> Path:
             seasons,
             raw_records,
         )
-        dump_yaml(staging / "subdomains.yml", setup_configuration(forcing_stations, seasons))
+        dump_yaml(
+            staging / "subdomains.yml",
+            setup_configuration(forcing_stations, snow_stations, seasons),
+        )
         write_pending_projects(staging, seasons)
 
         normalized_raw_records = []
