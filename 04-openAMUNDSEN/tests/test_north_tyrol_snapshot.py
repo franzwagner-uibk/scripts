@@ -214,9 +214,12 @@ def test_forcing_tail_is_trimmed_to_last_native_model_grid_timestamp() -> None:
 def test_project_configuration_is_pending_and_uses_correct_fsc_classes() -> None:
     project = project_configuration(hydrological_seasons(2022, 2022)[0])
     snowcover = project["obs"]["snowcover"]
+    data_assimilation = project["data_assimilation"]
 
-    assert project["data_assimilation"]["prior_forcing"]["ensemble_size"] == 30
-    assert project["data_assimilation"]["assimilation_events"] == []
+    assert data_assimilation["prior_forcing"]["ensemble_size"] == 30
+    assert data_assimilation["assimilation_events"] == []
+    assert data_assimilation["likelihood"]["scf"]["min_support_coverage_ratio"] == 0.1
+    assert "rebase_open_loop" not in data_assimilation["rejuvenation"]
     assert list(snowcover["classes"]["cloud"]) == [205, 255]
     assert list(snowcover["classes"]["water"]) == [210]
     assert list(snowcover["classes"]["nodata"]) == [215]
