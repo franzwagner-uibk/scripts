@@ -230,8 +230,12 @@ def test_setup_configuration_parses_with_pinned_openamundsen() -> None:
     import pandas as pd
 
     stations = pd.DataFrame([{"id": "P.S000", "x": 100.0, "y": 200.0}])
+    config = setup_configuration(stations, hydrological_seasons(2017, 2022))
+    grid_variables = config["output_data"]["grids"]["variables"]
 
-    parsed = openamundsen.parse_config(setup_configuration(stations, hydrological_seasons(2017, 2022)))
+    assert {"var": "snow.depth", "name": "snowdepth_instantaneous"} in grid_variables
+
+    parsed = openamundsen.parse_config(config)
 
     assert parsed.start_date == datetime(2017, 10, 1, 0, 0)
     assert parsed.end_date == datetime(2023, 9, 30, 21, 0)

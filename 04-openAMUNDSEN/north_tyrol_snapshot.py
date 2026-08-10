@@ -1164,7 +1164,10 @@ def setup_configuration(forcing_stations: Any, seasons: Sequence[Season]) -> dic
             "grids": {
                 "format": "netcdf",
                 "compress": True,
-                "variables": [{"var": "snow.depth", "name": "snowdepth_daily", "freq": "D"}],
+                "variables": [
+                    {"var": "snow.depth", "name": "snowdepth_daily", "freq": "D"},
+                    {"var": "snow.depth", "name": "snowdepth_instantaneous"},
+                ],
             },
         },
         "meteo": {
