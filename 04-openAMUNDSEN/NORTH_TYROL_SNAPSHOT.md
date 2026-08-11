@@ -31,25 +31,40 @@ been reviewed.
 ## Event scheduling and finalization
 
 `scheduleDAEvents.py` is the generic interface to the pure normalized-table
-scheduler in `da_event_scheduler.py`. The North Tyrol policy is versioned at
-`policies/north_tyrol_alternating_6day_v1.yml`. It uses alternating FSC and
-station-HS targets every six days from October 7 through July 31, deterministic
-observation matching, a 20% FSC cloud threshold and a shared elevation-aware
-station split.
+scheduler in `da_event_scheduler.py`. The current North Tyrol policy is
+versioned at `policies/north_tyrol_alternating_6day_v2.yml`. It uses alternating
+FSC and station-HS targets every six days from October 7 through July 31. FSC
+selection uses a stable reference footprint that excludes water and pixels that
+are nodata throughout the selected archive. The water mask must be identical in
+every retained scene; variability fails instead of being inferred. A domain
+passes with at most 20% cloud, at most 20% non-cloud invalid pixels, at least
+one valid pixel and finite uncertainty for every valid pixel. Candidate scenes
+rank by valid support,
+uncertainty p90 and mean, target offset and date after the project and leaf
+fulfillment constraints are satisfied.
 
 The fixed targets are not moved. FSC and station observations are matched
 within four days so retained adjacent slots can satisfy the five-to-seven-day
-gap contract despite irregular acquisitions. A missing slot remains an explicit
-exception and does not alter later slot types. Each observation type must fill
-at least 85% of its 25 annual targets.
+gap contract despite irregular acquisitions. Station observations are matched
+uniquely within half the model timestep of the configured daily assimilation
+time; for this 3 h setup the inclusive tolerance is 1.5 h. A missing slot
+remains an explicit exception and does not alter later slot types. Each
+observation type must fill at least 85% of its feasible annual targets in the
+top-level project and in every leaf with feasible support.
+
+The scheduler treats those fulfillment limits as hard constraints. It
+maximizes the temporally compatible retained-event count, then resolves the
+maximum-cardinality feasible schedule in deterministic per-target candidate
+rank order with memoized backtracking. This preserves leaf-specific support
+without materializing the combinatorial cross-product of all leaf miss counts.
 
 To inspect a normalized inventory without creating output:
 
 ```bash
 python 04-openAMUNDSEN/scheduleDAEvents.py \
-  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml \
   --fsc-inventory SNAPSHOT/inventories/fsc_scene_subdomain_quality.csv \
-  --snow-inventory SNAPSHOT/inventories/snow_station_daily_support.csv \
+  --snow-inventory SNAPSHOT/inventories/snow_station_timestep_support.csv \
   --station-metadata SNAPSHOT/data_working/obs/stations/stations_snow_depth.csv \
   --start 2022-10-01 \
   --end 2023-09-30 \
@@ -57,13 +72,44 @@ python 04-openAMUNDSEN/scheduleDAEvents.py \
   --preflight
 ```
 
-`finalizeNorthTyrolProjects.py` is the snapshot-specific adapter. Preflight
-verifies the accepted pending state, all recorded raw and working hashes, the
-schedule and the pinned image contract without writing. Normal execution copies
-the full snapshot to a timestamped sibling, creates the ES50 compact-retention
-projects, prepares all eight subdomains per project and validates their steps.
+`finalizeNorthTyrolProjects.py` is the North Tyrol adapter. It accepts both the
+original event-neutral snapshot and the current documentation-shaped canonical
+setup, provided a legacy snapshot contains the exact-timestep station inventory;
+daily station summaries are intentionally not accepted. A legacy FSC inventory
+must also contain stable reference/water-mask evidence and an explicit valid-FSC
+uncertainty count. Older inventories must be rebuilt from the retained NetCDF
+scenes and cannot fall back to a generic uncertainty count. Preflight is read-only.
+A canonical refresh builds a same-filesystem
+sibling while excluding old derived leaves and runtime artifacts, writes only
+the reviewed final event lists to each project YAML, removes the legacy event
+filter, regenerates all 48 leaves and validates their steps without propagation.
 It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
+
+Canonical refresh refuses runtime locks, live model processes and containers
+mounted on the setup. Host checks inspect both process arguments and
+`/proc/<pid>/cwd`, including relative-path commands started inside the setup.
+It also refuses completed results, restart data or model state by default.
+After the listed runtime artifacts have been reviewed, the
+explicit `--discard-runtime-artifacts` option authorizes their replacement in
+the staged transaction; it never overrides a live lock or process.
+
+The refresh writes deterministic target, event, quality, leaf-selection,
+exception and shared-role audits under `raw/metadata/`. It also inventories
+exact forcing flatlines and pairs co-temporal station snow depth with the native
+EURAC pixel and 3x3 neighborhood. These tables support review only; they never
+replace the final `data_assimilation.assimilation_events` lists in project YAML.
+The optional areal FSC audit requires an explicitly approved elevation-band
+width and applies no hidden default.
+
+The reviewed digest-pinned core image validates all 48 regenerated leaves
+before promotion. Active DA and benchmark stations must have same-ID
+observation CSVs and configured model points, and each station-HS event must
+have exact half-timestep support. Daily openAMUNDSEN snow-depth and SWE outputs
+must use `freq: D`; both compact variables must request at least one metric.
+The canonical transaction manifest records the scheduler commit, policy and
+image digests, parent provenance, discarded runtime paths and final promotion
+result.
 
 The accepted source polygons contain small overlaps that v0.9.4 correctly
 refuses. The adapter leaves the hashed working GeoPackage unchanged and derives
@@ -84,9 +130,9 @@ Any `results`, restart state or model artifact fails final acceptance.
 
 ```bash
 python 04-openAMUNDSEN/finalizeNorthTyrolProjects.py \
-  --setup-root /home/franz/workspace/openamundsen_da_runs/north_tyrol_subdomain_runs/north_tyrol_hydro_2017_2023_snapshot_v1 \
-  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml \
-  --image ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
+  --setup-root /home/franz/workspace/openamundsen_da_runs/north_tyrol_subdomain_runs/north_tyrol_subdomains_100m \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml \
+  --image ghcr.io/openamundsen/openamundsen-da@sha256:REVIEWED_CORE_IMAGE_DIGEST \
   --preflight
 ```
 
@@ -94,6 +140,9 @@ Remove `--preflight` only from a clean reviewed scripts commit. When Git is not
 available to the finalizer runtime, set `NORTH_TYROL_FINALIZER_COMMIT` to the
 exact reviewed 40-character Git commit. The final state is `READY_TO_RUN`; ES50
 model execution is deliberately a separate approval gate.
+
+If and only if reviewed runtime artifacts are intentionally being replaced,
+add `--discard-runtime-artifacts` to the non-preflight command.
 
 ## P8 preflight
 

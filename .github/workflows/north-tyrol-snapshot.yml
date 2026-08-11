@@ -9,12 +9,14 @@ on:
       - 04-openAMUNDSEN/finalizeNorthTyrolProjects.py
       - 04-openAMUNDSEN/north_tyrol_snapshot.py
       - 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml
+      - 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml
       - 04-openAMUNDSEN/scheduleDAEvents.py
       - 04-openAMUNDSEN/tests/test_da_event_scheduler.py
       - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
       - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
       - docs/superpowers/specs/2026-08-05-da-event-scheduler-finalization-design.md
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
+      - docs/superpowers/specs/2026-08-11-north-tyrol-scheduler-v2-design.md
   push:
     branches: [main]
     paths:
@@ -24,12 +26,14 @@ on:
       - 04-openAMUNDSEN/finalizeNorthTyrolProjects.py
       - 04-openAMUNDSEN/north_tyrol_snapshot.py
       - 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml
+      - 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml
       - 04-openAMUNDSEN/scheduleDAEvents.py
       - 04-openAMUNDSEN/tests/test_da_event_scheduler.py
       - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
       - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
       - docs/superpowers/specs/2026-08-05-da-event-scheduler-finalization-design.md
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
+      - docs/superpowers/specs/2026-08-11-north-tyrol-scheduler-v2-design.md
 
 permissions:
   contents: read

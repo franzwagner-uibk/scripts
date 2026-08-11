@@ -247,6 +247,93 @@ def classify_fsc(values: Any) -> dict[str, Any]:
     }
 
 
+def update_fsc_archive_support(current: Any | None, values: Any) -> Any:
+    """Accumulate pixels represented by at least one non-nodata archive value."""
+
+    import numpy as np
+
+    classes = classify_fsc(values)
+    if bool(np.asarray(classes["unknown"]).any()):
+        unknown_values = np.unique(np.asarray(values)[classes["unknown"]])
+        raise ValueError(f"Unknown FSC classes: {unknown_values.tolist()}")
+    observed = ~np.asarray(classes["nodata"], dtype=bool)
+    return observed.copy() if current is None else np.asarray(current, dtype=bool) | observed
+
+
+def update_fsc_archive_water_mask(current: Any | None, values: Any) -> Any:
+    """Return the stable archive water mask and reject scene-to-scene changes."""
+
+    import numpy as np
+
+    water = np.asarray(classify_fsc(values)["water"], dtype=bool)
+    if current is None:
+        return water.copy()
+    current = np.asarray(current, dtype=bool)
+    if current.shape != water.shape or not np.array_equal(current, water):
+        raise ValueError("FSC water mask varies within the selected archive")
+    return current
+
+
+def summarize_fsc_quality(
+    values: Any,
+    uncertainty: Any,
+    roi_mask: Any,
+    archive_support: Any,
+    archive_water_mask: Any,
+) -> dict[str, Any]:
+    """Summarize one scene over its stable non-water archive footprint."""
+
+    import numpy as np
+
+    values = np.asarray(values)
+    uncertainty = np.asarray(uncertainty)
+    roi_mask = np.asarray(roi_mask, dtype=bool)
+    archive_support = np.asarray(archive_support, dtype=bool)
+    archive_water_mask = np.asarray(archive_water_mask, dtype=bool)
+    shapes = {values.shape, uncertainty.shape, roi_mask.shape, archive_support.shape, archive_water_mask.shape}
+    if len(shapes) != 1:
+        raise ValueError("FSC, uncertainty, ROI and archive masks must have identical shapes")
+    classes = classify_fsc(values)
+    unknown_mask = np.asarray(classes["unknown"], dtype=bool) & roi_mask
+    if bool(unknown_mask.any()):
+        unknown_values = np.unique(values[unknown_mask])
+        raise ValueError(f"Unknown FSC classes: {unknown_values.tolist()}")
+    scene_water = np.asarray(classes["water"], dtype=bool)
+    if not np.array_equal(scene_water, archive_water_mask):
+        raise ValueError("FSC scene water mask differs from the stable archive water mask")
+    stable_roi = roi_mask & archive_support
+    water_mask = roi_mask & archive_water_mask
+    reference_mask = stable_roi & ~archive_water_mask
+    permanent_nodata = roi_mask & ~archive_support
+    class_masks = {
+        name: reference_mask & np.asarray(classes[name], dtype=bool)
+        for name in ("valid", "cloud", "nodata")
+    }
+    valid_uncertainty = np.isfinite(uncertainty) & class_masks["valid"]
+    uncertainty_values = uncertainty[valid_uncertainty]
+    counts = {name: int(mask.sum()) for name, mask in class_masks.items()}
+    reference_count = int(reference_mask.sum())
+    if reference_count != sum(counts.values()):
+        raise ValueError("FSC reference classes do not cover the stable non-water footprint")
+    return {
+        "pixel_count": int(roi_mask.sum()),
+        **{f"{name}_count": count for name, count in counts.items()},
+        "water_count": int(water_mask.sum()),
+        "water_mask_stable": True,
+        "permanent_nodata_count": int(permanent_nodata.sum()),
+        "reference_count": reference_count,
+        "valid_reference_fraction": counts["valid"] / reference_count if reference_count else 0.0,
+        "cloud_reference_fraction": counts["cloud"] / reference_count if reference_count else 0.0,
+        "invalid_reference_fraction": counts["nodata"] / reference_count if reference_count else 0.0,
+        "uncertainty_valid_fsc_count": int(valid_uncertainty.sum()),
+        "uncertainty_min": float(np.min(uncertainty_values)) if uncertainty_values.size else "",
+        "uncertainty_mean": float(np.mean(uncertainty_values)) if uncertainty_values.size else "",
+        "uncertainty_median": float(np.median(uncertainty_values)) if uncertainty_values.size else "",
+        "uncertainty_p90": float(np.percentile(uncertainty_values, 90)) if uncertainty_values.size else "",
+        "uncertainty_max": float(np.max(uncertainty_values)) if uncertainty_values.size else "",
+    }
+
+
 def read_ascii_header(path: Path) -> AsciiGridHeader:
     """Read and validate an ESRI ASCII grid header."""
 
@@ -647,6 +734,7 @@ def prepare_snow_observations(
     working_dir = working_root / "obs" / "stations"
     working_dir.mkdir(parents=True, exist_ok=True)
     inventory_rows: list[dict[str, Any]] = []
+    timestep_rows: list[dict[str, Any]] = []
     role_rows: list[dict[str, Any]] = []
 
     for station in stations.itertuples(index=False):
@@ -688,6 +776,15 @@ def prepare_snow_observations(
         if len(matches) != 1:
             raise ValueError(f"Snow station {station_id} maps to {len(matches)} subdomains")
         subdomain_id = matches[0]
+        timestep_rows.extend(
+            {
+                "timestamp": timestamp.isoformat(sep=" "),
+                "subdomain_id": subdomain_id,
+                "station_id": station_id,
+                "valid_observation_count": 1,
+            }
+            for timestamp in normalized["time"]
+        )
         for day in all_days:
             inventory_rows.append(
                 {
@@ -734,6 +831,11 @@ def prepare_snow_observations(
             "first_observation",
             "last_observation",
         ),
+    )
+    write_csv(
+        inventory_root / "snow_station_timestep_support.csv",
+        timestep_rows,
+        ("timestamp", "subdomain_id", "station_id", "valid_observation_count"),
     )
     return stations
 
@@ -970,6 +1072,10 @@ def prepare_fsc(
     rows: list[dict[str, Any]] = []
     scene_records: list[dict[str, Any]] = []
     masks: dict[str, Any] | None = None
+    archive_support: Any | None = None
+    archive_water_mask: Any | None = None
+    reference_x: Any | None = None
+    reference_y: Any | None = None
     min_x, min_y, max_x, max_y = roi_geometry.bounds
     for index, (scene_date, source) in enumerate(scenes, start=1):
         print(f"FSC {index}/{len(scenes)} {scene_date.isoformat()}", flush=True)
@@ -1023,6 +1129,8 @@ def prepare_fsc(
             raise ValueError(f"EURAC FSC is not on its native 50 m grid: {source}")
         transform = from_origin(float(x.min() - 25.0), float(y.max() + 25.0), 50.0, 50.0)
         if masks is None:
+            reference_x = np.asarray(x).copy()
+            reference_y = np.asarray(y).copy()
             masks = {}
             for subdomain in subdomains.itertuples(index=False):
                 mask = features.rasterize(
@@ -1035,34 +1143,11 @@ def prepare_fsc(
                 if not mask.any():
                     raise ValueError(f"No FSC pixels for subdomain {subdomain.id}")
                 masks[str(subdomain.id)] = mask
+        elif not np.array_equal(x, reference_x) or not np.array_equal(y, reference_y):
+            raise ValueError(f"EURAC FSC crop grid changed within the archive: {source}")
         fsc_array = np.asarray(fsc_data.values)
-        uncertainty_array = np.asarray(uncertainty_data.values)
-        for subdomain_id, mask in masks.items():
-            values = fsc_array[mask]
-            classes = classify_fsc(values)
-            if int(classes["unknown"].sum()) > 0:
-                unknown_values = np.unique(values[classes["unknown"]])
-                raise ValueError(f"Unknown FSC classes in {source}: {unknown_values.tolist()}")
-            uncertainty_values = uncertainty_array[mask]
-            uncertainty_valid = uncertainty_values[np.isfinite(uncertainty_values)]
-            total = int(mask.sum())
-            counts = {name: int(classes[name].sum()) for name in ("valid", "cloud", "water", "nodata")}
-            rows.append(
-                {
-                    "date": scene_date.isoformat(),
-                    "subdomain_id": subdomain_id,
-                    "source_file": source.name,
-                    "pixel_count": total,
-                    **{f"{name}_count": count for name, count in counts.items()},
-                    **{f"{name}_fraction": count / total for name, count in counts.items()},
-                    "uncertainty_count": int(uncertainty_valid.size),
-                    "uncertainty_min": float(np.min(uncertainty_valid)) if uncertainty_valid.size else "",
-                    "uncertainty_mean": float(np.mean(uncertainty_valid)) if uncertainty_valid.size else "",
-                    "uncertainty_median": float(np.median(uncertainty_valid)) if uncertainty_valid.size else "",
-                    "uncertainty_p90": float(np.percentile(uncertainty_valid, 90)) if uncertainty_valid.size else "",
-                    "uncertainty_max": float(np.max(uncertainty_valid)) if uncertainty_valid.size else "",
-                }
-            )
+        archive_support = update_fsc_archive_support(archive_support, fsc_array)
+        archive_water_mask = update_fsc_archive_water_mask(archive_water_mask, fsc_array)
         scene_records.append(
             {
                 "date": scene_date.isoformat(),
@@ -1076,6 +1161,44 @@ def prepare_fsc(
         )
         subset.close()
 
+    if masks is None or archive_support is None or archive_water_mask is None:
+        raise ValueError("No FSC scenes were available for quality inventory generation")
+    for scene_record in scene_records:
+        working_path = Path(str(scene_record["working"]))
+        with xr.open_dataset(working_path) as dataset:
+            fsc_data = dataset["fsc"]
+            uncertainty_data = dataset["uncertainty"]
+            for dimension in tuple(fsc_data.dims):
+                if dimension not in {"y", "x"}:
+                    fsc_data = fsc_data.isel({dimension: 0})
+            for dimension in tuple(uncertainty_data.dims):
+                if dimension not in {"y", "x"}:
+                    uncertainty_data = uncertainty_data.isel({dimension: 0})
+            fsc_array = np.asarray(fsc_data.values)
+            uncertainty_array = np.asarray(uncertainty_data.values)
+        for subdomain_id, mask in masks.items():
+            quality = summarize_fsc_quality(
+                fsc_array,
+                uncertainty_array,
+                mask,
+                archive_support,
+                archive_water_mask,
+            )
+            total = int(quality["pixel_count"])
+            rows.append(
+                {
+                    "date": str(scene_record["date"]),
+                    "subdomain_id": subdomain_id,
+                    "source_file": working_path.name,
+                    **quality,
+                    **{
+                        f"{name}_fraction": int(quality[f"{name}_count"]) / total
+                        for name in ("valid", "cloud", "water", "nodata")
+                    },
+                    "uncertainty_count": quality["uncertainty_valid_fsc_count"],
+                }
+            )
+
     write_csv(
         inventory_root / "fsc_scene_subdomain_quality.csv",
         rows,
@@ -1087,11 +1210,18 @@ def prepare_fsc(
             "valid_count",
             "cloud_count",
             "water_count",
+            "water_mask_stable",
             "nodata_count",
+            "permanent_nodata_count",
             "valid_fraction",
             "cloud_fraction",
             "water_fraction",
             "nodata_fraction",
+            "reference_count",
+            "valid_reference_fraction",
+            "cloud_reference_fraction",
+            "invalid_reference_fraction",
+            "uncertainty_valid_fsc_count",
             "uncertainty_count",
             "uncertainty_min",
             "uncertainty_mean",
@@ -1183,6 +1313,7 @@ def setup_configuration(
                 "compress": True,
                 "variables": [
                     {"var": "snow.depth", "name": "snowdepth_daily", "freq": "D"},
+                    {"var": "snow.swe", "name": "swe_daily", "freq": "D"},
                     {"var": "snow.depth", "name": "snowdepth_instantaneous"},
                 ],
             },
@@ -1336,15 +1467,6 @@ def project_configuration(season: Season) -> dict[str, Any]:
                 "min_station_uncertainty_pct": 10,
                 "single_station_factor": 2.0,
             },
-            "subdomain_event_filter": {
-                "enabled": True,
-                "drop_unavailable": True,
-                "variables": {
-                    "scf": {"max_cloud_fraction": 0.2},
-                    "station_hs": {"min_active_stations": 1, "max_time_delta_hours": 36},
-                },
-                "subdomains": {"AT-07-20": {"variables": {"scf": {"max_cloud_fraction": 0.25}}}},
-            },
             "landcover_mask": {"enabled": True, "classes_to_exclude": _flow([2, 3, 13])},
             "likelihood": {
                 "scf": {
@@ -1477,7 +1599,6 @@ def write_pending_projects(root: Path, seasons: Sequence[Season]) -> None:
         "data_assimilation.prior_forcing",
         "data_assimilation.h_of_x",
         "data_assimilation.station",
-        "data_assimilation.subdomain_event_filter",
         "data_assimilation.likelihood",
         "data_assimilation.uncertainty",
         "data_assimilation.resampling",
