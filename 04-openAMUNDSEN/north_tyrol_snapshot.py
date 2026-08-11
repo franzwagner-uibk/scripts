@@ -260,11 +260,26 @@ def update_fsc_archive_support(current: Any | None, values: Any) -> Any:
     return observed.copy() if current is None else np.asarray(current, dtype=bool) | observed
 
 
+def update_fsc_archive_water_mask(current: Any | None, values: Any) -> Any:
+    """Return the stable archive water mask and reject scene-to-scene changes."""
+
+    import numpy as np
+
+    water = np.asarray(classify_fsc(values)["water"], dtype=bool)
+    if current is None:
+        return water.copy()
+    current = np.asarray(current, dtype=bool)
+    if current.shape != water.shape or not np.array_equal(current, water):
+        raise ValueError("FSC water mask varies within the selected archive")
+    return current
+
+
 def summarize_fsc_quality(
     values: Any,
     uncertainty: Any,
     roi_mask: Any,
     archive_support: Any,
+    archive_water_mask: Any,
 ) -> dict[str, Any]:
     """Summarize one scene over its stable non-water archive footprint."""
 
@@ -274,16 +289,21 @@ def summarize_fsc_quality(
     uncertainty = np.asarray(uncertainty)
     roi_mask = np.asarray(roi_mask, dtype=bool)
     archive_support = np.asarray(archive_support, dtype=bool)
-    if values.shape != uncertainty.shape or values.shape != roi_mask.shape or values.shape != archive_support.shape:
-        raise ValueError("FSC, uncertainty, ROI and archive-support grids must have identical shapes")
+    archive_water_mask = np.asarray(archive_water_mask, dtype=bool)
+    shapes = {values.shape, uncertainty.shape, roi_mask.shape, archive_support.shape, archive_water_mask.shape}
+    if len(shapes) != 1:
+        raise ValueError("FSC, uncertainty, ROI and archive masks must have identical shapes")
     classes = classify_fsc(values)
     unknown_mask = np.asarray(classes["unknown"], dtype=bool) & roi_mask
     if bool(unknown_mask.any()):
         unknown_values = np.unique(values[unknown_mask])
         raise ValueError(f"Unknown FSC classes: {unknown_values.tolist()}")
+    scene_water = np.asarray(classes["water"], dtype=bool)
+    if not np.array_equal(scene_water, archive_water_mask):
+        raise ValueError("FSC scene water mask differs from the stable archive water mask")
     stable_roi = roi_mask & archive_support
-    water_mask = stable_roi & np.asarray(classes["water"], dtype=bool)
-    reference_mask = stable_roi & ~water_mask
+    water_mask = roi_mask & archive_water_mask
+    reference_mask = stable_roi & ~archive_water_mask
     permanent_nodata = roi_mask & ~archive_support
     class_masks = {
         name: reference_mask & np.asarray(classes[name], dtype=bool)
@@ -299,6 +319,7 @@ def summarize_fsc_quality(
         "pixel_count": int(roi_mask.sum()),
         **{f"{name}_count": count for name, count in counts.items()},
         "water_count": int(water_mask.sum()),
+        "water_mask_stable": True,
         "permanent_nodata_count": int(permanent_nodata.sum()),
         "reference_count": reference_count,
         "valid_reference_fraction": counts["valid"] / reference_count if reference_count else 0.0,
@@ -1052,6 +1073,7 @@ def prepare_fsc(
     scene_records: list[dict[str, Any]] = []
     masks: dict[str, Any] | None = None
     archive_support: Any | None = None
+    archive_water_mask: Any | None = None
     reference_x: Any | None = None
     reference_y: Any | None = None
     min_x, min_y, max_x, max_y = roi_geometry.bounds
@@ -1125,6 +1147,7 @@ def prepare_fsc(
             raise ValueError(f"EURAC FSC crop grid changed within the archive: {source}")
         fsc_array = np.asarray(fsc_data.values)
         archive_support = update_fsc_archive_support(archive_support, fsc_array)
+        archive_water_mask = update_fsc_archive_water_mask(archive_water_mask, fsc_array)
         scene_records.append(
             {
                 "date": scene_date.isoformat(),
@@ -1138,7 +1161,7 @@ def prepare_fsc(
         )
         subset.close()
 
-    if masks is None or archive_support is None:
+    if masks is None or archive_support is None or archive_water_mask is None:
         raise ValueError("No FSC scenes were available for quality inventory generation")
     for scene_record in scene_records:
         working_path = Path(str(scene_record["working"]))
@@ -1159,6 +1182,7 @@ def prepare_fsc(
                 uncertainty_array,
                 mask,
                 archive_support,
+                archive_water_mask,
             )
             total = int(quality["pixel_count"])
             rows.append(
@@ -1186,6 +1210,7 @@ def prepare_fsc(
             "valid_count",
             "cloud_count",
             "water_count",
+            "water_mask_stable",
             "nodata_count",
             "permanent_nodata_count",
             "valid_fraction",

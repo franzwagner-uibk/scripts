@@ -27,6 +27,8 @@ apart. A skipped target does not change later target types.
 FSC quality is evaluated separately for every scene and subdomain:
 
 - the reference footprint excludes water pixels;
+- the archive-wide water mask must be identical in every retained scene;
+  scene-to-scene water-mask variability is rejected rather than guessed;
 - pixels that are nodata throughout the complete selected archive are excluded
   from the stable reference footprint;
 - cloud fraction is cloud pixels divided by the reference footprint and must
@@ -59,6 +61,13 @@ project and leaf fulfillment constraints, FSC choices rank by total valid
 support, uncertainty p90, uncertainty mean, target offset, date and source
 identity. Station-HS choices rank by active DA support and then use the same
 deterministic target-offset and identity fallbacks.
+
+Fulfillment is a hard scheduling constraint, not a score that may be traded
+between leaves. The dynamic program tracks the remaining allowed misses for
+every project/type and leaf/type constraint. Paths with different support
+profiles therefore remain distinct until feasibility is decided; a path that
+overfills one leaf cannot hide a shortfall in another. Quality ranking is
+applied only among schedules that satisfy every hard constraint.
 
 ## Shared station roles
 
@@ -119,7 +128,10 @@ never an alternate runtime schedule.
 Legacy snapshot mode retains the existing sibling-staging workflow and recorded
 hash checks. It requires the builder's exact-timestep station inventory and
 refuses legacy daily-only summaries because they cannot prove half-timestep
-support.
+support. It also refuses FSC inventories that predate the stable-reference,
+stable-water-mask and uncertainty-valid-count schema. Such inventories must be
+rebuilt from retained NetCDF scenes; `uncertainty_count` is not accepted as a
+proxy for complete uncertainty on valid FSC pixels.
 
 Canonical refresh mode recognizes the documentation-shaped setup by its single
 setup YAML and required `env/`, `grids/`, `meteo/`, `obs/`, `projects/` and
@@ -135,12 +147,19 @@ logs. It never edits the accepted canonical root. Within staging it:
 2. updates all six top-level project schedules and observation-filter policy;
 3. preserves ES50, compact retention and all unrelated DA parameters;
 4. ensures openAMUNDSEN grid outputs include daily snow depth and daily SWE;
-5. keeps DA compact outputs for both `snowdepth_daily` and `swe_daily`;
+5. requires `freq: D` for both openAMUNDSEN outputs and nonempty compact metrics
+   for both `snowdepth_daily` and `swe_daily`;
 6. removes all derived leaf projects and regenerates them with the reviewed,
    digest-pinned image;
 7. recreates deterministic observation files and steps without propagation;
 8. validates the entire staged setup and automatically promotes it only after
    acceptance.
+
+Before promotion, the digest-pinned core image runs its strengthened pre-run
+assimilation-requirement validator over all 48 leaves. This proves same-ID
+station CSV and model-point identity for active DA and benchmark roles and
+exact half-timestep support for every authored station-HS event. The adapter
+does not reimplement or weaken that runtime contract.
 
 The image argument must contain an immutable `@sha256:` digest. It is recorded
 but is not tied to the obsolete v0.9.4 digest.
@@ -169,11 +188,22 @@ schedule feasibility, station roles and image digest before copying. All
 destructive cleanup happens only in staging. Staging failures are marked
 `INCOMPLETE`; the canonical tree remains untouched.
 
+A canonical refresh refuses runtime lock markers, a host model process or a
+container mounted on the setup. Completed results, restart data or model state
+also cause refusal unless the operator explicitly supplies
+`--discard-runtime-artifacts` after reviewing the listed paths. That
+acknowledgement never overrides a live process or lock.
+
 After staged acceptance, the canonical root is renamed to a temporary sibling
 backup and staging is renamed to the canonical name. The promoted path is
 validated again. A post-swap failure restores the original root. The backup is
 removed only after the promoted setup passes. Promotion is automatic after
 validation; model propagation remains a separate explicit approval.
+
+The final transaction manifest records the scheduler commit, policy digest,
+immutable image, canonical parent identity, parent transaction/config digests,
+discarded runtime paths and whether the transaction is only staged or fully
+promoted. It hashes configuration provenance, not the scientific data tree.
 
 ## Acceptance
 
@@ -191,6 +221,7 @@ Acceptance requires:
   contracts;
 - 48 regenerated leaf projects with steps equal to retained leaf events plus
   initialization;
+- successful strengthened core requirement validation for all 48 leaves;
 - no results, restart state, model state, container output or propagation;
 - only relative, contained preparation links;
 - deterministic audits and a final transaction manifest.

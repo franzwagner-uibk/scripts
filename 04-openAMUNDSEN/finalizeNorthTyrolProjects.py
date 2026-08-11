@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", required=True, type=Path)
     parser.add_argument("--image", required=True)
     parser.add_argument("--preflight", action="store_true")
+    parser.add_argument(
+        "--discard-runtime-artifacts",
+        action="store_true",
+        help="Explicitly allow a canonical refresh to replace completed results/restart artifacts",
+    )
     return parser.parse_args()
 
 
@@ -192,11 +197,43 @@ def build_schedules(
     )
     return schedule_with_adaptive_roles(
         policy=load_policy(policy_path),
-        fsc_rows=read_csv_records(root / "inventories" / "fsc_scene_subdomain_quality.csv"),
+        fsc_rows=_read_legacy_fsc_inventory(root),
         snow_rows=read_csv_records(timestep_inventory),
         station_rows=read_csv_records(root / "data_working" / "obs" / "stations" / "stations_snow_depth.csv"),
         windows=windows,
     )
+
+
+def _read_legacy_fsc_inventory(root: Path) -> list[dict[str, str]]:
+    """Require FSC evidence produced from stable archive masks and uncertainties."""
+
+    path = root / "inventories" / "fsc_scene_subdomain_quality.csv"
+    rows = read_csv_records(path)
+    required = {
+        "reference_count",
+        "permanent_nodata_count",
+        "water_mask_stable",
+        "valid_count",
+        "cloud_count",
+        "nodata_count",
+        "water_count",
+        "cloud_reference_fraction",
+        "invalid_reference_fraction",
+        "uncertainty_valid_fsc_count",
+        "uncertainty_mean",
+        "uncertainty_p90",
+    }
+    columns = set(rows[0]) if rows else set()
+    missing = sorted(required - columns)
+    if missing:
+        raise ValueError(
+            "Legacy FSC inventory predates the stable-reference quality schema; "
+            "rebuild it from retained NetCDF scenes before scheduling. Missing columns: "
+            + ", ".join(missing)
+        )
+    if any(str(row["water_mask_stable"]).strip().lower() not in {"true", "1"} for row in rows):
+        raise ValueError("Legacy FSC inventory does not prove one stable archive-wide water mask")
+    return rows
 
 
 def _build_canonical_schedules(
@@ -285,7 +322,11 @@ def _canonical_fsc_inventory(root: Path) -> list[dict[str, Any]]:
     from rasterio import features
     from rasterio.transform import from_origin
 
-    from north_tyrol_snapshot import summarize_fsc_quality, update_fsc_archive_support
+    from north_tyrol_snapshot import (
+        summarize_fsc_quality,
+        update_fsc_archive_support,
+        update_fsc_archive_water_mask,
+    )
 
     import geopandas as gpd
 
@@ -298,6 +339,7 @@ def _canonical_fsc_inventory(root: Path) -> list[dict[str, Any]]:
     reference_x: Any | None = None
     reference_y: Any | None = None
     archive_support: Any | None = None
+    archive_water_mask: Any | None = None
     for path in paths:
         with xr.open_dataset(path) as dataset:
             required = {"fsc", "uncertainty", "x", "y", "time"}
@@ -341,7 +383,11 @@ def _canonical_fsc_inventory(root: Path) -> list[dict[str, Any]]:
             elif not np.array_equal(x, reference_x) or not np.array_equal(y, reference_y):
                 raise ValueError(f"FSC scene grid differs from the archive reference grid: {path}")
             archive_support = update_fsc_archive_support(archive_support, np.asarray(fsc.values))
-    if masks is None or archive_support is None:
+            archive_water_mask = update_fsc_archive_water_mask(
+                archive_water_mask,
+                np.asarray(fsc.values),
+            )
+    if masks is None or archive_support is None or archive_water_mask is None:
         raise ValueError("Unable to derive FSC archive support")
 
     rows: list[dict[str, Any]] = []
@@ -364,6 +410,7 @@ def _canonical_fsc_inventory(root: Path) -> list[dict[str, Any]]:
                 uncertainty_values,
                 mask,
                 archive_support,
+                archive_water_mask,
             )
             rows.append(
                 {
@@ -471,12 +518,25 @@ def _validate_output_point_identities(
     return {"forcing_output_points": 161, "snow_output_points": 35, "output_points": 196}
 
 
-def finalize(root: Path, policy_path: Path, image: str) -> Path:
+def finalize(
+    root: Path,
+    policy_path: Path,
+    image: str,
+    *,
+    discard_runtime_artifacts: bool = False,
+) -> Path:
     """Finalize in sibling staging, atomically promote and rollback on failure."""
 
     root = Path(root).resolve()
     if detect_setup_layout(root) == CANONICAL_LAYOUT:
-        return _refresh_canonical_setup(root, policy_path, image)
+        return _refresh_canonical_setup(
+            root,
+            policy_path,
+            image,
+            discard_runtime_artifacts=discard_runtime_artifacts,
+        )
+    if discard_runtime_artifacts:
+        raise ValueError("--discard-runtime-artifacts is only valid for a canonical setup refresh")
     initial = preflight(root, policy_path, image)
     commit = _finalizer_commit()
     stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
@@ -528,11 +588,33 @@ def finalize(root: Path, policy_path: Path, image: str) -> Path:
         raise
 
 
-def _refresh_canonical_setup(root: Path, policy_path: Path, image: str) -> Path:
+def _refresh_canonical_setup(
+    root: Path,
+    policy_path: Path,
+    image: str,
+    *,
+    discard_runtime_artifacts: bool,
+) -> Path:
     """Replace a canonical setup from a fully validated lightweight staging tree."""
 
+    _assert_canonical_runtime_safe(
+        root,
+        discard_runtime_artifacts=discard_runtime_artifacts,
+    )
+    runtime_artifacts = _canonical_runtime_artifacts(root)
+    runtime_artifact_paths = [path.relative_to(root).as_posix() for path in runtime_artifacts]
     source = validate_canonical_setup(root, image)
     roles, schedules = build_schedules(root, policy_path)
+    commit = _finalizer_commit()
+    parent_configs = {
+        _canonical_setup_yaml(root).relative_to(root).as_posix(): sha256_file(_canonical_setup_yaml(root)),
+        **{
+            path.relative_to(root).as_posix(): sha256_file(path)
+            for path in sorted((root / "projects").glob("project_*/project_*.yml"))
+        },
+    }
+    parent_transaction = root / "raw" / "metadata" / "canonical_refresh_manifest.json"
+    parent_manifest_sha256 = sha256_file(parent_transaction) if parent_transaction.is_file() else None
     initial = {
         "status": "PREFLIGHT_OK",
         "layout": CANONICAL_LAYOUT,
@@ -559,13 +641,48 @@ def _refresh_canonical_setup(root: Path, policy_path: Path, image: str) -> Path:
             schedules,
             regions_path="/setup/env/subdomains.gpkg",
         )
+        _validate_all_leaf_core_requirements(staging, image)
         _relativize_internal_symlinks(staging)
-        validate_canonical_refresh(staging, schedules)
+        _write_canonical_refresh_manifest(
+            staging,
+            schedules=schedules,
+            roles=roles,
+            policy_path=policy_path,
+            image=image,
+            commit=commit,
+            parent_root=root,
+            parent_manifest_sha256=parent_manifest_sha256,
+            parent_configs=parent_configs,
+            discarded_runtime_artifacts=runtime_artifact_paths,
+            promotion_result="staging_validated",
+        )
+        validate_canonical_refresh(
+            staging,
+            schedules,
+            expected_promotion_result="staging_validated",
+        )
         root.replace(backup)
         try:
             staging.replace(root)
             swapped = True
-            validate_canonical_refresh(root, schedules)
+            _write_canonical_refresh_manifest(
+                root,
+                schedules=schedules,
+                roles=roles,
+                policy_path=policy_path,
+                image=image,
+                commit=commit,
+                parent_root=root,
+                parent_manifest_sha256=parent_manifest_sha256,
+                parent_configs=parent_configs,
+                discarded_runtime_artifacts=runtime_artifact_paths,
+                promotion_result="promoted",
+            )
+            validate_canonical_refresh(
+                root,
+                schedules,
+                expected_promotion_result="promoted",
+            )
         except BaseException:
             if root.exists():
                 failed = root.parent / f".{root.name}.failed-refresh-{stamp}"
@@ -579,6 +696,113 @@ def _refresh_canonical_setup(root: Path, policy_path: Path, image: str) -> Path:
         if not swapped and staging.exists():
             _write_incomplete(staging, str(exc))
         raise
+
+
+def _assert_canonical_runtime_safe(
+    root: Path,
+    *,
+    discard_runtime_artifacts: bool,
+) -> None:
+    """Refuse live work and require acknowledgement before replacing runtime data."""
+
+    root = Path(root).resolve()
+    lock_names = {"RUNNING", ".RUNNING", "run.lock", "project.lock"}
+    locks = sorted(path for path in root.rglob("*") if path.is_file() and path.name in lock_names)
+    if locks:
+        raise RuntimeError(f"Canonical setup contains active runtime lock markers: {locks[:10]}")
+    active = _active_model_references(root)
+    if active:
+        raise RuntimeError("Canonical setup is referenced by active model work:\n- " + "\n- ".join(active))
+    artifacts = _canonical_runtime_artifacts(root)
+    if artifacts and not discard_runtime_artifacts:
+        raise RuntimeError(
+            "Canonical setup contains runtime artifacts that refresh would replace. "
+            "Review them, then rerun with --discard-runtime-artifacts: "
+            + ", ".join(str(path.relative_to(root)) for path in artifacts[:10])
+        )
+
+
+def _canonical_runtime_artifacts(root: Path) -> list[Path]:
+    patterns = (
+        "results",
+        "restart",
+        "model_state",
+        "model_state*.pickle*",
+        "state_pointer.json",
+        "*.restart*",
+        "*.log",
+        "run_manifest.json",
+        "subdomain_run_manifest.json",
+    )
+    return sorted(
+        {
+            path
+            for pattern in patterns
+            for path in Path(root).rglob(pattern)
+            if path.exists()
+        }
+    )
+
+
+def _active_model_references(root: Path) -> list[str]:
+    """Return host processes or containers whose commands/mounts reference the setup."""
+
+    root = Path(root).resolve()
+    references: list[str] = []
+    process_table = subprocess.run(
+        ["ps", "-eo", "pid=,args="],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process_table.returncode:
+        raise RuntimeError(f"Cannot inspect host processes: {process_table.stderr.strip()}")
+    root_text = str(root)
+    for line in process_table.stdout.splitlines():
+        lowered = line.lower()
+        model_markers = (
+            "openamundsen-da run",
+            "openamundsen-da subdomains run",
+            "openamundsen_da.pipeline",
+        )
+        if root_text in line and any(marker in lowered for marker in model_markers):
+            references.append(f"host process {line.strip()}")
+
+    container_ids = subprocess.run(
+        ["docker", "ps", "-q"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if container_ids.returncode:
+        raise RuntimeError(f"Cannot inspect running Docker containers: {container_ids.stderr.strip()}")
+    ids = container_ids.stdout.split()
+    if ids:
+        inspected = subprocess.run(
+            ["docker", "inspect", *ids],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if inspected.returncode:
+            raise RuntimeError(f"Cannot inspect running Docker containers: {inspected.stderr.strip()}")
+        for container in json.loads(inspected.stdout):
+            container_name = str(container.get("Name", "")).lstrip("/")
+            for mount in container.get("Mounts") or []:
+                source = Path(str(mount.get("Source", "")))
+                try:
+                    source.resolve().relative_to(root)
+                    overlaps = True
+                except (OSError, ValueError):
+                    try:
+                        root.relative_to(source.resolve())
+                        overlaps = True
+                    except (OSError, ValueError):
+                        overlaps = False
+                if overlaps:
+                    references.append(f"Docker container {container_name or container.get('Id', '')}")
+                    break
+    return sorted(set(references))
 
 
 def _canonical_copy_ignore(directory: str, names: list[str]) -> set[str]:
@@ -671,6 +895,8 @@ def _ensure_openamundsen_snow_outputs(setup: dict[str, Any]) -> None:
             raise ValueError(
                 f"openAMUNDSEN grid output {name} maps to {existing[0].get('var')!r}, not {variable!r}"
             )
+        if existing and str(existing[0].get("freq", "")) != "D":
+            raise ValueError(f"openAMUNDSEN grid output {name} must use freq: D")
         if not existing:
             variables.append({"var": variable, "name": name, "freq": "D"})
 
@@ -694,6 +920,10 @@ def _ensure_compact_snow_outputs(data_assimilation: dict[str, Any], project_name
             raise ValueError(
                 f"Compact grid output {name} maps to {by_name[name][0].get('var')!r}: {project_name}"
             )
+        if by_name.get(name):
+            metrics = by_name[name][0].get("metrics")
+            if not isinstance(metrics, list) or not metrics:
+                raise ValueError(f"Compact grid output {name} requires non-empty metrics: {project_name}")
     if "snowdepth_daily" not in by_name:
         variables.append(
             {
@@ -768,6 +998,50 @@ def _write_canonical_audits(
     )
     _write_forcing_flatline_inventory(staging)
     _write_station_fsc_audit(staging, schedules, load_policy(policy_path))
+
+
+def _write_canonical_refresh_manifest(
+    root: Path,
+    *,
+    schedules: Mapping[str, ScheduleResult],
+    roles: StationRoleResult,
+    policy_path: Path,
+    image: str,
+    commit: str,
+    parent_root: Path,
+    parent_manifest_sha256: str | None,
+    parent_configs: Mapping[str, str],
+    discarded_runtime_artifacts: Sequence[str],
+    promotion_result: str,
+) -> None:
+    """Record the canonical refresh transaction without hashing scientific data."""
+
+    if promotion_result not in {"staging_validated", "promoted"}:
+        raise ValueError(f"Invalid canonical promotion result: {promotion_result}")
+    payload = {
+        "schema_version": FINALIZER_SCHEMA_VERSION,
+        "scheduler_commit": commit,
+        "policy_sha256": sha256_file(policy_path),
+        "image": image,
+        "parent_root": str(Path(parent_root).resolve()),
+        "parent_manifest_sha256": parent_manifest_sha256,
+        "parent_config_sha256": dict(sorted(parent_configs.items())),
+        "discarded_runtime_artifacts": list(discarded_runtime_artifacts),
+        "promotion_result": promotion_result,
+        "recorded_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "core_leaf_requirement_validations": 48,
+        "projects": {
+            name: {
+                "event_count": len(schedules[name].events),
+                "by_variable": schedules[name].summary["by_variable"],
+                "by_subdomain": schedules[name].summary["by_subdomain"],
+            }
+            for name in EXPECTED_PROJECTS
+        },
+        "station_roles": _role_counts(roles.roles),
+        "station_role_exceptions": list(roles.exceptions),
+    }
+    _write_json(root / "raw" / "metadata" / "canonical_refresh_manifest.json", payload)
 
 
 def _write_forcing_flatline_inventory(root: Path, *, minimum_samples: int = 8) -> None:
@@ -1219,10 +1493,49 @@ def _fsc_stratum_row(
 def validate_canonical_refresh(
     root: Path,
     schedules: Mapping[str, ScheduleResult],
+    *,
+    expected_promotion_result: str,
 ) -> dict[str, Any]:
     """Validate refreshed projects and deterministic preparation without propagation."""
 
     _validate_internal_symlinks(root)
+    transaction_path = root / "raw" / "metadata" / "canonical_refresh_manifest.json"
+    if not transaction_path.is_file():
+        raise FileNotFoundError(transaction_path)
+    transaction = _read_json(transaction_path)
+    required_transaction_fields = {
+        "scheduler_commit",
+        "policy_sha256",
+        "image",
+        "parent_root",
+        "parent_manifest_sha256",
+        "parent_config_sha256",
+        "promotion_result",
+    }
+    missing_transaction_fields = sorted(required_transaction_fields - set(transaction))
+    if missing_transaction_fields:
+        raise ValueError(f"Canonical refresh manifest lacks fields: {missing_transaction_fields}")
+    if transaction["promotion_result"] != expected_promotion_result:
+        raise ValueError(
+            "Canonical refresh promotion result differs: "
+            f"{transaction['promotion_result']!r} != {expected_promotion_result!r}"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", str(transaction["scheduler_commit"])):
+        raise ValueError("Canonical refresh manifest has an invalid scheduler commit")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(transaction["policy_sha256"])):
+        raise ValueError("Canonical refresh manifest has an invalid policy digest")
+    validate_image_reference(str(transaction["image"]))
+    parent_manifest = transaction["parent_manifest_sha256"]
+    if parent_manifest is not None and not re.fullmatch(r"[0-9a-f]{64}", str(parent_manifest)):
+        raise ValueError("Canonical refresh manifest has an invalid parent-manifest digest")
+    parent_configs = transaction["parent_config_sha256"]
+    if not isinstance(parent_configs, Mapping) or not parent_configs or any(
+        not re.fullmatch(r"[0-9a-f]{64}", str(digest))
+        for digest in parent_configs.values()
+    ):
+        raise ValueError("Canonical refresh manifest has invalid parent-config digests")
+    if int(transaction.get("core_leaf_requirement_validations", 0)) != 48:
+        raise ValueError("Canonical refresh manifest does not record 48 core leaf validations")
     forbidden = [
         path
         for pattern in (
@@ -1242,11 +1555,11 @@ def validate_canonical_refresh(
     setup = _read_yaml(_canonical_setup_yaml(root))
     setup_variables = setup.get("output_data", {}).get("grids", {}).get("variables", [])
     required_setup_outputs = {
-        ("snow.depth", "snowdepth_daily"),
-        ("snow.swe", "swe_daily"),
+        ("snow.depth", "snowdepth_daily", "D"),
+        ("snow.swe", "swe_daily", "D"),
     }
     actual_setup_outputs = {
-        (str(item.get("var", "")), str(item.get("name", "")))
+        (str(item.get("var", "")), str(item.get("name", "")), str(item.get("freq", "")))
         for item in setup_variables
         if isinstance(item, Mapping)
     }
@@ -1273,6 +1586,17 @@ def validate_canonical_refresh(
         }
         if not required_compact_outputs <= actual_compact_outputs:
             raise ValueError(f"Refreshed project lacks required compact snow outputs: {project_name}")
+        compact_by_name = {
+            str(item.get("name", item.get("var", ""))): item
+            for item in compact_variables
+            if isinstance(item, Mapping)
+        }
+        if any(
+            not isinstance(compact_by_name[name].get("metrics"), list)
+            or not compact_by_name[name]["metrics"]
+            for name in ("snowdepth_daily", "swe_daily")
+        ):
+            raise ValueError(f"Refreshed project has empty compact snow metrics: {project_name}")
         expected_events = [
             (str(event["selected_date"]), str(event["variable"]))
             for event in schedules[project_name].events
@@ -1308,6 +1632,17 @@ def validate_canonical_refresh(
             }
             if not required_compact_outputs <= leaf_compact_outputs:
                 raise ValueError(f"Leaf compact snow outputs are incomplete: {project_name}/{leaf.name}")
+            leaf_compact_by_name = {
+                str(item.get("name", item.get("var", ""))): item
+                for item in leaf_da["output"]["grids"]["variables"]
+                if isinstance(item, Mapping)
+            }
+            if any(
+                not isinstance(leaf_compact_by_name[name].get("metrics"), list)
+                or not leaf_compact_by_name[name]["metrics"]
+                for name in ("snowdepth_daily", "swe_daily")
+            ):
+                raise ValueError(f"Leaf compact snow metrics are empty: {project_name}/{leaf.name}")
             if "subdomain_event_filter" in leaf_da:
                 raise ValueError(f"Legacy event selection remains in leaf YAML: {project_name}/{leaf.name}")
             expected_leaf_events = [
@@ -1539,6 +1874,56 @@ def _write_leaf_event_schedules(
         if not data_assimilation["assimilation_events"]:
             raise ValueError(f"Externally selected leaf event list is empty: {project_name}/{leaf_dir.name}")
         _write_yaml(project_path, project)
+
+
+def _validate_all_leaf_core_requirements(staging: Path, image: str) -> None:
+    """Run the pinned core pre-run requirement validator for every leaf."""
+
+    script = """
+from pathlib import Path
+
+from openamundsen_da.io.paths import list_steps_sorted
+from openamundsen_da.util.da_events import load_assimilation_events
+from openamundsen_da.util.validation import validate_assimilation_requirements
+
+root = Path('/setup')
+leaf_projects = sorted(root.glob('projects/project_*/subdomains/AT-*/projects/project_*'))
+if len(leaf_projects) != 48:
+    raise ValueError(f'Expected 48 leaf projects for core validation, got {len(leaf_projects)}')
+for project_dir in leaf_projects:
+    setup_dir = project_dir.parents[1]
+    steps = list_steps_sorted(project_dir)
+    events = load_assimilation_events(project_dir)
+    if len(steps) != len(events) + 1:
+        raise ValueError(f'Step/event mismatch before core validation: {project_dir}')
+    validate_assimilation_requirements(
+        setup_dir=setup_dir,
+        project_dir=project_dir,
+        steps=steps,
+        events=events,
+    )
+print('CORE_REQUIREMENTS_OK=48')
+"""
+    _run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--read-only",
+            "--network",
+            "none",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,noexec,size=1g",
+            "--volume",
+            f"{staging}:/setup:ro",
+            image,
+            "python",
+            "-c",
+            script,
+        ]
+    )
 
 
 def _canonical_subdomain_ids(root: Path) -> tuple[str, ...]:
@@ -1797,10 +2182,13 @@ def _validate_fsc_event_links(root: Path) -> None:
     }
     event_rows = read_csv_records(root / "inventories" / "da_event_scheduler" / "events.csv")
     quality_rows = read_csv_records(root / "inventories" / "fsc_scene_subdomain_quality.csv")
-    uncertainty_counts = {
-        (str(row["date"]), str(row["source_file"])): int(float(row["uncertainty_count"]))
-        for row in quality_rows
-    }
+    uncertainty_counts: dict[tuple[str, str], int] = {}
+    for row in quality_rows:
+        key = (str(row["date"]), str(row["source_file"]))
+        uncertainty_counts[key] = max(
+            uncertainty_counts.get(key, 0),
+            int(float(row["uncertainty_valid_fsc_count"])),
+        )
     for event in event_rows:
         if event["variable"] != "scf":
             continue
@@ -1968,7 +2356,12 @@ def main() -> int:
     if args.preflight:
         print(json.dumps(preflight(args.setup_root, args.policy, args.image), indent=2, sort_keys=True))
         return 0
-    output = finalize(args.setup_root, args.policy, args.image)
+    output = finalize(
+        args.setup_root,
+        args.policy,
+        args.image,
+        discard_runtime_artifacts=args.discard_runtime_artifacts,
+    )
     print(f"READY_TO_RUN: {output}")
     return 0
 

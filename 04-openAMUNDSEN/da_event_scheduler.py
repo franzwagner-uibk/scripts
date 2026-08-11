@@ -458,18 +458,59 @@ def schedule_events(
                 )
                 for slot in slots
             )
-    coverage_keys = tuple(key for key in sorted(feasible_counts) if feasible_counts[key] > 0)
-    score_size = len(coverage_keys) + 12
-    states: dict[tuple[int | None, int | None], tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]]] = {
-        (None, None): ((0,) * score_size, ())
+    fulfillment_keys = tuple(key for key in sorted(feasible_counts) if feasible_counts[key] > 0)
+    miss_allowances = tuple(
+        feasible_counts[key] - math.ceil(policy.minimum_fulfillment * feasible_counts[key])
+        for key in fulfillment_keys
+    )
+    slot_feasibility = {
+        slot.index: tuple(
+            slot.variable == variable
+            and any(
+                subdomain_id == "__project__" or subdomain_id in candidate.supported_subdomains
+                for candidate in options_by_slot[slot.index]
+            )
+            for subdomain_id, variable in fulfillment_keys
+        )
+        for slot in slots
+    }
+    zero_misses = (0,) * len(fulfillment_keys)
+    zero_quality = (0,) * 10
+    states: dict[
+        tuple[int | None, bool, tuple[int, ...]],
+        tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]],
+    ] = {
+        (None, False, zero_misses): (zero_quality, ())
     }
     for slot in slots:
         next_states: dict[
-            tuple[int | None, int | None],
+            tuple[int | None, bool, tuple[int, ...]],
             tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]],
         ] = {}
-        for (last_ordinal, last_slot), (score, path) in states.items():
-            _keep_best(next_states, (last_ordinal, last_slot), score, path, len(coverage_keys))
+        violated_keys: set[tuple[str, str]] = set()
+        for (last_ordinal, previous_slot_selected, misses), (quality_score, path) in states.items():
+            skipped_misses = tuple(
+                current + int(feasible)
+                for current, feasible in zip(misses, slot_feasibility[slot.index], strict=True)
+            )
+            skip_violations = {
+                key
+                for key, current, allowance in zip(
+                    fulfillment_keys,
+                    skipped_misses,
+                    miss_allowances,
+                    strict=True,
+                )
+                if current > allowance
+            }
+            violated_keys.update(skip_violations)
+            if not skip_violations:
+                _keep_constraint_state(
+                    next_states,
+                    (last_ordinal, False, skipped_misses),
+                    quality_score,
+                    path,
+                )
             for candidate in options_by_slot[slot.index]:
                 delta = abs((candidate.selected_date - slot.target_date).days)
                 ordinal = candidate.selected_date.toordinal()
@@ -479,26 +520,59 @@ def schedule_events(
                     gap = ordinal - last_ordinal
                     if gap < policy.minimum_gap_days:
                         continue
-                    if last_slot == slot.index - 1 and gap > policy.maximum_gap_days:
+                    if previous_slot_selected and gap > policy.maximum_gap_days:
                         continue
-                candidate_score = _candidate_score(
+                added_misses = _candidate_misses(
                     candidate,
-                    delta,
-                    coverage_keys,
-                    feasible_counts,
+                    fulfillment_keys,
+                    slot_feasibility[slot.index],
                 )
-                combined = tuple(left + right for left, right in zip(score, candidate_score))
-                _keep_best(
+                updated_misses = tuple(
+                    current + added
+                    for current, added in zip(misses, added_misses, strict=True)
+                )
+                candidate_violations = {
+                    key
+                    for key, current, allowance in zip(
+                        fulfillment_keys,
+                        updated_misses,
+                        miss_allowances,
+                        strict=True,
+                    )
+                    if current > allowance
+                }
+                violated_keys.update(candidate_violations)
+                if candidate_violations:
+                    continue
+                candidate_quality = _candidate_quality(candidate, delta)
+                updated_quality = tuple(
+                    left + right
+                    for left, right in zip(quality_score, candidate_quality, strict=True)
+                )
+                _keep_constraint_state(
                     next_states,
-                    (ordinal, slot.index),
-                    combined,
+                    (ordinal, True, updated_misses),
+                    updated_quality,
                     path + ((slot, candidate),),
-                    len(coverage_keys),
                 )
         states = next_states
-    _, selected_path = max(
-        states.values(),
-        key=lambda item: (_score_rank(item[0], len(coverage_keys)), _path_tie_key(item[1])),
+        if not states:
+            constraints = ", ".join(
+                f"{'project' if subdomain_id == '__project__' else subdomain_id} {variable}"
+                for subdomain_id, variable in sorted(violated_keys)
+            ) or "configured per-project and per-subdomain/type"
+            raise ValueError(
+                "No event schedule satisfies all per-project and per-subdomain/type feasible-slot "
+                f"fulfillment constraints of {policy.minimum_fulfillment:.1%} together with the global "
+                f"date and gap constraints. Search exhausted at slot {slot.index}; rejected paths "
+                f"exceeded one or more of: {constraints}"
+            )
+    _, (_, selected_path) = max(
+        states.items(),
+        key=lambda item: (
+            item[1][0],
+            _path_tie_key(item[1][1]),
+        ),
     )
     selected_by_slot = {slot.index: candidate for slot, candidate in selected_path}
     events: list[dict[str, Any]] = []
@@ -558,56 +632,51 @@ def schedule_events(
     return ScheduleResult(slots, targets, tuple(events), tuple(quality), tuple(exceptions), summary)
 
 
-def _keep_best(
-    states: dict[tuple[int | None, int | None], tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]]],
-    key: tuple[int | None, int | None],
-    score: tuple[int, ...],
+def _keep_constraint_state(
+    states: dict[
+        tuple[int | None, bool, tuple[int, ...]],
+        tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]],
+    ],
+    key: tuple[int | None, bool, tuple[int, ...]],
+    quality_score: tuple[int, ...],
     path: tuple[tuple[Slot, Candidate], ...],
-    coverage_count: int,
 ) -> None:
-    current = states.get(key)
-    if current is None or (_score_rank(score, coverage_count), _path_tie_key(path)) > (
-        _score_rank(current[0], coverage_count),
-        _path_tie_key(current[1]),
+    """Keep the best additive quality path for one exact constraint state."""
+
+    existing = states.get(key)
+    if existing is None or (quality_score, _path_tie_key(path)) > (
+        existing[0],
+        _path_tie_key(existing[1]),
     ):
-        states[key] = (score, path)
+        states[key] = (quality_score, path)
 
 
-def _score_rank(score: tuple[int, ...], coverage_count: int) -> tuple[int, ...]:
-    """Prioritize balanced per-type fulfillment before quality tie breakers."""
-
-    coverage = score[:coverage_count]
-    quality = score[coverage_count:]
+def _candidate_misses(
+    candidate: Candidate,
+    fulfillment_keys: Sequence[tuple[str, str]],
+    slot_feasibility: Sequence[bool],
+) -> tuple[int, ...]:
     return (
-        min(coverage, default=0),
-        *sorted(coverage),
-        min(quality[1], quality[2]),
-        quality[0],
-        quality[1],
-        quality[2],
-        *quality[3:],
+        *(
+            1
+            if feasible
+            and not (
+                candidate.variable == variable
+                and (subdomain_id == "__project__" or subdomain_id in candidate.supported_subdomains)
+            )
+            else 0
+            for (subdomain_id, variable), feasible in zip(
+                fulfillment_keys,
+                slot_feasibility,
+                strict=True,
+            )
+        ),
     )
 
 
-def _candidate_score(
-    candidate: Candidate,
-    delta: int,
-    coverage_keys: Sequence[tuple[str, str]],
-    feasible_counts: Mapping[tuple[str, str], int],
-) -> tuple[int, ...]:
-    is_fsc = int(candidate.variable == "scf")
-    is_station = int(candidate.variable == "station_hs")
+def _candidate_quality(candidate: Candidate, delta: int) -> tuple[int, ...]:
     return (
-        *(
-            1_000_000 // feasible_counts[(subdomain_id, variable)]
-            if candidate.variable == variable
-            and (subdomain_id == "__project__" or subdomain_id in candidate.supported_subdomains)
-            else 0
-            for subdomain_id, variable in coverage_keys
-        ),
         1,
-        is_fsc,
-        is_station,
         candidate.valid_support_count,
         candidate.active_da_stations,
         len(candidate.active_station_ids),
@@ -701,9 +770,12 @@ def fsc_reference_metrics(row: Mapping[str, Any]) -> dict[str, float | int | boo
         permanent = _integer(row.get("permanent_nodata_count", 0), field="permanent_nodata_count")
         if _integer(pixel_count, field="pixel_count") != reference + water + permanent:
             raise ValueError("FSC class counts do not sum to pixel_count")
-    has_explicit_uncertainty_support = row.get("uncertainty_valid_fsc_count") not in (None, "")
+    if row.get("uncertainty_valid_fsc_count") in (None, ""):
+        raise ValueError("FSC quality row lacks uncertainty_valid_fsc_count")
+    if str(row.get("water_mask_stable", "")).strip().lower() not in {"true", "1"}:
+        raise ValueError("FSC quality row does not prove a stable archive water mask")
     uncertainty_valid_count = _integer(
-        row.get("uncertainty_valid_fsc_count", row.get("uncertainty_count", 0)),
+        row.get("uncertainty_valid_fsc_count"),
         field="uncertainty_valid_fsc_count",
     )
     return {
@@ -716,11 +788,7 @@ def fsc_reference_metrics(row: Mapping[str, Any]) -> dict[str, float | int | boo
         "cloud_reference_fraction": cloud / reference,
         "invalid_reference_fraction": nodata / reference,
         "uncertainty_valid_fsc_count": uncertainty_valid_count,
-        "uncertainty_complete": (
-            uncertainty_valid_count == valid
-            if has_explicit_uncertainty_support
-            else uncertainty_valid_count >= valid
-        ),
+        "uncertainty_complete": uncertainty_valid_count == valid,
     }
 
 

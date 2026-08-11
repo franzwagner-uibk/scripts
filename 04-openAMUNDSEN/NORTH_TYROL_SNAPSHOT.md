@@ -35,7 +35,8 @@ scheduler in `da_event_scheduler.py`. The current North Tyrol policy is
 versioned at `policies/north_tyrol_alternating_6day_v2.yml`. It uses alternating
 FSC and station-HS targets every six days from October 7 through July 31. FSC
 selection uses a stable reference footprint that excludes water and pixels that
-are nodata throughout the selected archive. A domain passes with at most 20%
+are nodata throughout the selected archive. The water mask must be identical in
+every retained scene; variability fails instead of being inferred. A domain passes with at most 20%
 cloud, at most 20% non-cloud invalid pixels, at least one valid pixel and finite
 uncertainty for every valid pixel. Candidate scenes rank by valid support,
 uncertainty p90 and mean, target offset and date after the project and leaf
@@ -67,13 +68,22 @@ python 04-openAMUNDSEN/scheduleDAEvents.py \
 `finalizeNorthTyrolProjects.py` is the North Tyrol adapter. It accepts both the
 original event-neutral snapshot and the current documentation-shaped canonical
 setup, provided a legacy snapshot contains the exact-timestep station inventory;
-daily station summaries are intentionally not accepted. Preflight is read-only.
+daily station summaries are intentionally not accepted. A legacy FSC inventory
+must also contain stable reference/water-mask evidence and an explicit valid-FSC
+uncertainty count. Older inventories must be rebuilt from the retained NetCDF
+scenes and cannot fall back to a generic uncertainty count. Preflight is read-only.
 A canonical refresh builds a same-filesystem
 sibling while excluding old derived leaves and runtime artifacts, writes only
 the reviewed final event lists to each project YAML, removes the legacy event
 filter, regenerates all 48 leaves and validates their steps without propagation.
 It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
+
+Canonical refresh refuses runtime locks, live model processes and containers
+mounted on the setup. It also refuses completed results, restart data or model
+state by default. After the listed runtime artifacts have been reviewed, the
+explicit `--discard-runtime-artifacts` option authorizes their replacement in
+the staged transaction; it never overrides a live lock or process.
 
 The refresh writes deterministic target, event, quality, leaf-selection,
 exception and shared-role audits under `raw/metadata/`. It also inventories
@@ -82,6 +92,15 @@ EURAC pixel and 3x3 neighborhood. These tables support review only; they never
 replace the final `data_assimilation.assimilation_events` lists in project YAML.
 The optional areal FSC audit requires an explicitly approved elevation-band
 width and applies no hidden default.
+
+The reviewed digest-pinned core image validates all 48 regenerated leaves
+before promotion. Active DA and benchmark stations must have same-ID
+observation CSVs and configured model points, and each station-HS event must
+have exact half-timestep support. Daily openAMUNDSEN snow-depth and SWE outputs
+must use `freq: D`; both compact variables must request at least one metric.
+The canonical transaction manifest records the scheduler commit, policy and
+image digests, parent provenance, discarded runtime paths and final promotion
+result.
 
 The accepted source polygons contain small overlaps that v0.9.4 correctly
 refuses. The adapter leaves the hashed working GeoPackage unchanged and derives
@@ -112,6 +131,9 @@ Remove `--preflight` only from a clean reviewed scripts commit. When Git is not
 available to the finalizer runtime, set `NORTH_TYROL_FINALIZER_COMMIT` to the
 exact reviewed 40-character Git commit. The final state is `READY_TO_RUN`; ES50
 model execution is deliberately a separate approval gate.
+
+If and only if reviewed runtime artifacts are intentionally being replaced,
+add `--discard-runtime-artifacts` to the non-preflight command.
 
 ## P8 preflight
 

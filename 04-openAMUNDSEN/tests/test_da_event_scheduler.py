@@ -62,6 +62,7 @@ def _fsc(day: str, *, cloud: int = 10, invalid: int = 10, water: int = 20) -> li
             "cloud_count": cloud,
             "nodata_count": invalid,
             "water_count": water,
+            "water_mask_stable": True,
             "uncertainty_count": 80,
             "uncertainty_valid_fsc_count": 100 - cloud - invalid,
             "uncertainty_mean": 10.0,
@@ -186,6 +187,11 @@ def test_fsc_reference_excludes_water_and_separates_cloud_from_invalid() -> None
     )
     assert rejected_row["rejection_reasons"] == ["incomplete_uncertainty"]
 
+    legacy = dict(_fsc("2022-10-07")[0])
+    legacy.pop("uncertainty_valid_fsc_count")
+    with pytest.raises(ValueError, match="uncertainty_valid_fsc_count"):
+        fsc_reference_metrics(legacy)
+
 
 def test_fsc_ranking_prefers_valid_support_then_uncertainty_and_offset() -> None:
     policy = replace(_policy(), interval_end=(10, 7))
@@ -209,7 +215,7 @@ def test_leaf_type_fulfillment_fails_when_no_common_schedule_can_reach_85_percen
     second = _fsc("2022-10-08")
     first[1].update({"valid_count": 69, "cloud_count": 10, "nodata_count": 21, "uncertainty_valid_fsc_count": 69})
     second[0].update({"valid_count": 69, "cloud_count": 10, "nodata_count": 21, "uncertainty_valid_fsc_count": 69})
-    with pytest.raises(ValueError, match=r"[AB] scf feasible-slot fulfillment"):
+    with pytest.raises(ValueError, match=r"feasible-slot fulfillment.*Search exhausted"):
         schedule_events(
             policy=policy,
             fsc_rows=[*first, *second],
@@ -218,6 +224,65 @@ def test_leaf_type_fulfillment_fails_when_no_common_schedule_can_reach_85_percen
             start=date(2022, 10, 1),
             end=date(2022, 10, 31),
         )
+
+
+def test_scheduler_preserves_leaf_fulfillment_counterexample() -> None:
+    def scene(day: str, supported: set[str], *, stronger_a: bool = False) -> list[dict[str, object]]:
+        rows = []
+        for domain in ("A", "B", "C"):
+            passes = domain in supported
+            valid = 90 if passes and stronger_a and domain == "A" else (80 if passes else 69)
+            invalid = 5 if valid == 90 else (10 if passes else 21)
+            rows.append(
+                {
+                    "date": day,
+                    "subdomain_id": domain,
+                    "source_file": f"scene_{day}.nc",
+                    "pixel_count": 100,
+                    "valid_count": valid,
+                    "cloud_count": 100 - valid - invalid,
+                    "nodata_count": invalid,
+                    "water_count": 0,
+                    "water_mask_stable": True,
+                    "uncertainty_valid_fsc_count": valid,
+                    "uncertainty_mean": 10.0,
+                    "uncertainty_p90": 12.0,
+                }
+            )
+        return rows
+
+    # The higher-quality Nov 5 choice yields A=7/7, B=4/5, C=3/3 and is
+    # infeasible. The Nov 7 choice yields A=6/7, B=5/5, C=3/3 and satisfies
+    # every 85% leaf/type constraint. Paths converge again on Nov 12.
+    rows = [
+        *scene("2022-10-07", {"A", "B", "C"}),
+        *scene("2022-10-13", {"A", "B", "C"}),
+        *scene("2022-10-19", {"A", "B", "C"}),
+        *scene("2022-10-25", {"A", "B"}),
+        *scene("2022-10-31", {"A"}),
+        *scene("2022-11-05", {"A"}, stronger_a=True),
+        *scene("2022-11-07", {"B"}),
+        *scene("2022-11-12", {"A"}),
+    ]
+    result = schedule_events(
+        policy=replace(
+            _policy(),
+            sequence=("scf",),
+            interval_end=(11, 12),
+        ),
+        fsc_rows=rows,
+        snow_rows=[],
+        station_roles=(),
+        start=date(2022, 10, 1),
+        end=date(2022, 11, 30),
+    )
+
+    assert "2022-11-07" in {event["selected_date"] for event in result.events}
+    assert "2022-11-05" not in {event["selected_date"] for event in result.events}
+    assert {
+        domain: result.summary["by_subdomain"][domain]["scf"]["retained"]
+        for domain in ("A", "B", "C")
+    } == {"A": 6, "B": 5, "C": 3}
 
 
 def test_station_half_timestep_tie_is_rejected() -> None:
@@ -403,6 +468,18 @@ def test_image_requires_immutable_digest() -> None:
         finalizer.validate_image_reference("registry.example/oa:latest")
 
 
+def test_legacy_fsc_inventory_requires_stable_reference_schema(tmp_path: Path) -> None:
+    inventory = tmp_path / "inventories"
+    inventory.mkdir()
+    (inventory / "fsc_scene_subdomain_quality.csv").write_text(
+        "date,subdomain_id,source_file,cloud_fraction,uncertainty_count\n"
+        "2017-10-07,A,scene.nc,0.1,10\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="rebuild it from retained NetCDF"):
+        finalizer._read_legacy_fsc_inventory(tmp_path)
+
+
 def test_output_point_identity_contract_requires_161_plus_35() -> None:
     snow_ids = [f"snow_{index:02d}" for index in range(35)]
     points = [
@@ -434,6 +511,30 @@ def test_maintained_snow_output_mappings_are_added_and_mismatches_fail() -> None
     }
     with pytest.raises(ValueError, match="swe_daily maps"):
         finalizer._ensure_openamundsen_snow_outputs(broken)
+
+    wrong_frequency = {
+        "output_data": {
+            "grids": {
+                "variables": [{"name": "swe_daily", "var": "snow.swe", "freq": "3H"}],
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="freq: D"):
+        finalizer._ensure_openamundsen_snow_outputs(wrong_frequency)
+
+    with pytest.raises(ValueError, match="non-empty metrics"):
+        finalizer._ensure_compact_snow_outputs(
+            {
+                "output": {
+                    "grids": {
+                        "variables": [
+                            {"name": "snowdepth_daily", "var": "snowdepth_daily", "metrics": []},
+                        ]
+                    }
+                }
+            },
+            "project",
+        )
 
 
 def test_forcing_flatline_inventory_respects_gaps_and_minimum_length() -> None:
@@ -577,6 +678,134 @@ def test_failed_staging_keeps_accepted_tree_and_marks_incomplete(
     assert (staging / "INCOMPLETE.json").is_file()
 
 
+def test_canonical_runtime_replacement_requires_ack_and_never_ignores_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = tmp_path / "projects" / "project_2017_2018" / "results"
+    results.mkdir(parents=True)
+    monkeypatch.setattr(finalizer, "_active_model_references", lambda _root: [])
+
+    with pytest.raises(RuntimeError, match="--discard-runtime-artifacts"):
+        finalizer._assert_canonical_runtime_safe(
+            tmp_path,
+            discard_runtime_artifacts=False,
+        )
+    finalizer._assert_canonical_runtime_safe(
+        tmp_path,
+        discard_runtime_artifacts=True,
+    )
+
+    lock = tmp_path / "project.lock"
+    lock.write_text("active\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="lock markers"):
+        finalizer._assert_canonical_runtime_safe(
+            tmp_path,
+            discard_runtime_artifacts=True,
+        )
+    lock.unlink()
+    monkeypatch.setattr(
+        finalizer,
+        "_active_model_references",
+        lambda _root: ["host process 123 openamundsen-da run /setup"],
+    )
+    with pytest.raises(RuntimeError, match="active model work"):
+        finalizer._assert_canonical_runtime_safe(
+            tmp_path,
+            discard_runtime_artifacts=True,
+        )
+
+
+def test_failed_canonical_refresh_keeps_source_and_marks_staging_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "north_tyrol_subdomains_100m"
+    root.mkdir()
+    (root / "setup.yml").write_text("domain: north_tyrol\n", encoding="utf-8")
+    policy_path = tmp_path / "policy.yml"
+    policy_path.write_text("schema_version: 2\n", encoding="utf-8")
+    sentinel = root / "accepted.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    roles = StationRoleResult((), ())
+    monkeypatch.setattr(finalizer, "_assert_canonical_runtime_safe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(finalizer, "validate_canonical_setup", lambda *_args: {"root": str(root)})
+    monkeypatch.setattr(finalizer, "build_schedules", lambda *_args: (roles, {}))
+    monkeypatch.setattr(finalizer, "_finalizer_commit", lambda: "a" * 40)
+    for function_name in (
+        "_write_canonical_station_roles",
+        "_refresh_canonical_configs",
+        "_write_canonical_audits",
+    ):
+        monkeypatch.setattr(finalizer, function_name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        finalizer,
+        "_prepare_all_projects",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic canonical failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic canonical failure"):
+        finalizer._refresh_canonical_setup(
+            root,
+            policy_path,
+            "registry.example/openamundsen-da@sha256:" + "a" * 64,
+            discard_runtime_artifacts=True,
+        )
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    staging = next(tmp_path.glob(".north_tyrol_subdomains_100m.refreshing-*"))
+    assert (staging / "INCOMPLETE.json").is_file()
+
+
+def test_post_swap_validation_failure_restores_canonical_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "north_tyrol_subdomains_100m"
+    root.mkdir()
+    (root / "north_tyrol_subdomains_100m.yml").write_text("domain: north_tyrol\n", encoding="utf-8")
+    policy_path = tmp_path / "policy.yml"
+    policy_path.write_text("schema_version: 2\n", encoding="utf-8")
+    sentinel = root / "accepted.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    roles = StationRoleResult((), ())
+    schedules: dict[str, ScheduleResult] = {}
+    monkeypatch.setattr(finalizer, "_assert_canonical_runtime_safe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(finalizer, "validate_canonical_setup", lambda *_args: {"root": str(root)})
+    monkeypatch.setattr(finalizer, "build_schedules", lambda *_args: (roles, schedules))
+    monkeypatch.setattr(finalizer, "_finalizer_commit", lambda: "a" * 40)
+    for function_name in (
+        "_write_canonical_station_roles",
+        "_refresh_canonical_configs",
+        "_write_canonical_audits",
+        "_prepare_all_projects",
+        "_validate_all_leaf_core_requirements",
+        "_relativize_internal_symlinks",
+        "_write_canonical_refresh_manifest",
+    ):
+        monkeypatch.setattr(finalizer, function_name, lambda *_args, **_kwargs: None)
+    validations = 0
+
+    def validate(*_args: object, **_kwargs: object) -> None:
+        nonlocal validations
+        validations += 1
+        if validations == 2:
+            raise RuntimeError("synthetic post-swap failure")
+
+    monkeypatch.setattr(finalizer, "validate_canonical_refresh", validate)
+
+    with pytest.raises(RuntimeError, match="synthetic post-swap failure"):
+        finalizer._refresh_canonical_setup(
+            root,
+            policy_path,
+            "registry.example/openamundsen-da@sha256:" + "a" * 64,
+            discard_runtime_artifacts=True,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    failed = next(tmp_path.glob(".north_tyrol_subdomains_100m.failed-refresh-*"))
+    assert (failed / "INCOMPLETE.json").is_file()
+
+
 def test_leaf_yaml_receives_only_externally_selected_supported_events(tmp_path: Path) -> None:
     project_name = "project_2017_2018"
     leaf_ids = tuple(f"AT-{index:02d}" for index in range(8))
@@ -639,3 +868,62 @@ def test_leaf_yaml_receives_only_externally_selected_supported_events(tmp_path: 
     assert "subdomain_event_filter" not in first
     assert [event["date"] for event in first["assimilation_events"]] == ["2017-10-07", "2017-10-13"]
     assert [event["date"] for event in second["assimilation_events"]] == ["2017-10-07"]
+
+
+def test_canonical_acceptance_invokes_pinned_core_validator_for_all_leaves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(finalizer, "_run", lambda command: commands.append(list(command)))
+    image = "registry.example/openamundsen-da@sha256:" + "a" * 64
+
+    finalizer._validate_all_leaf_core_requirements(tmp_path, image)
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert image in command
+    assert "--network" in command and command[command.index("--network") + 1] == "none"
+    assert f"{tmp_path}:/setup:ro" in command
+    script = command[-1]
+    assert "list_steps_sorted" in script
+    assert "validate_assimilation_requirements" in script
+    assert "CORE_REQUIREMENTS_OK=48" in script
+
+
+def test_canonical_transaction_manifest_records_reviewed_inputs(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.yml"
+    policy.write_text("schema_version: 2\n", encoding="utf-8")
+    schedule = ScheduleResult(
+        slots=(),
+        targets=(),
+        events=(),
+        quality=(),
+        exceptions=(),
+        summary={"by_variable": {}, "by_subdomain": {}},
+    )
+    schedules = {name: schedule for name in finalizer.EXPECTED_PROJECTS}
+    image = "registry.example/openamundsen-da@sha256:" + "a" * 64
+
+    finalizer._write_canonical_refresh_manifest(
+        tmp_path,
+        schedules=schedules,
+        roles=StationRoleResult((), ()),
+        policy_path=policy,
+        image=image,
+        commit="b" * 40,
+        parent_root=tmp_path / "parent",
+        parent_manifest_sha256="d" * 64,
+        parent_configs={"setup.yml": "c" * 64},
+        discarded_runtime_artifacts=["projects/project_2017_2018/results"],
+        promotion_result="promoted",
+    )
+
+    manifest = finalizer._read_json(
+        tmp_path / "raw" / "metadata" / "canonical_refresh_manifest.json"
+    )
+    assert manifest["scheduler_commit"] == "b" * 40
+    assert manifest["image"] == image
+    assert manifest["parent_manifest_sha256"] == "d" * 64
+    assert manifest["parent_config_sha256"] == {"setup.yml": "c" * 64}
+    assert manifest["promotion_result"] == "promoted"

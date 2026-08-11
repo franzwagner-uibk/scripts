@@ -37,6 +37,7 @@ from north_tyrol_snapshot import (  # noqa: E402
     setup_configuration,
     summarize_fsc_quality,
     update_fsc_archive_support,
+    update_fsc_archive_water_mask,
     validate_options,
     write_json,
     write_pending_projects,
@@ -99,6 +100,7 @@ def test_fsc_quality_excludes_water_and_permanently_unsupported_pixels() -> None
         np.array([np.nan, np.nan, 7.0, np.nan]),
         np.ones(4, dtype=bool),
         archive_support,
+        np.array([False, False, False, True]),
     )
 
     assert quality["pixel_count"] == 4
@@ -108,6 +110,13 @@ def test_fsc_quality_excludes_water_and_permanently_unsupported_pixels() -> None
     assert quality["valid_count"] == 1
     assert quality["nodata_count"] == 1
     assert quality["uncertainty_valid_fsc_count"] == 1
+    assert quality["water_mask_stable"] is True
+
+
+def test_fsc_archive_water_mask_variability_is_rejected() -> None:
+    mask = update_fsc_archive_water_mask(None, np.array([0.0, 210.0]))
+    with pytest.raises(ValueError, match="water mask varies"):
+        update_fsc_archive_water_mask(mask, np.array([210.0, 0.0]))
 
 
 def test_ascii_crop_window_aligns_to_original_cells() -> None:
