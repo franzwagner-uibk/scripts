@@ -579,6 +579,116 @@ def _select_schedule_path(
         )
         for slot in slots
     }
+    candidate_support = {
+        slot.index: tuple(
+            tuple(
+                candidate.variable == variable
+                and (
+                    subdomain_id == "__project__"
+                    or subdomain_id in candidate.supported_subdomains
+                )
+                for subdomain_id, variable in fulfillment_keys
+            )
+            for candidate in ranked_options[slot.index]
+        )
+        for slot in slots
+    }
+    feasible_prefix: list[tuple[int, ...]] = [(0,) * len(fulfillment_keys)]
+    for slot in slots:
+        feasible_prefix.append(
+            tuple(
+                count + int(feasible)
+                for count, feasible in zip(
+                    feasible_prefix[-1],
+                    slot_feasibility[slot.index],
+                    strict=True,
+                )
+            )
+        )
+    required_support = tuple(
+        feasible - allowance
+        for feasible, allowance in zip(
+            feasible_prefix[-1],
+            miss_allowances,
+            strict=True,
+        )
+    )
+    future_key_slot_maxima: list[tuple[int, ...]] = [
+        (0,) * len(fulfillment_keys)
+        for _ in range(len(slots) + 1)
+    ]
+    future_fsc_sources: list[frozenset[str]] = [
+        frozenset() for _ in range(len(slots) + 1)
+    ]
+    future_non_fsc_candidate_slots = [0] * (len(slots) + 1)
+    for slot_index in range(len(slots) - 1, -1, -1):
+        slot = slots[slot_index]
+        vectors = candidate_support[slot.index]
+        future_key_slot_maxima[slot_index] = tuple(
+            future_key_slot_maxima[slot_index + 1][key_index]
+            + int(any(vector[key_index] for vector in vectors))
+            for key_index in range(len(fulfillment_keys))
+        )
+        slot_fsc_sources = frozenset(
+            candidate.source_file
+            for candidate in ranked_options[slot.index]
+            if candidate.variable == "scf"
+        )
+        future_fsc_sources[slot_index] = (
+            future_fsc_sources[slot_index + 1] | slot_fsc_sources
+        )
+        future_non_fsc_candidate_slots[slot_index] = (
+            future_non_fsc_candidate_slots[slot_index + 1]
+            + int(
+                slot.variable != "scf"
+                and bool(ranked_options[slot.index])
+            )
+        )
+
+    leaf_key_indices = tuple(
+        key_index
+        for key_index, (subdomain_id, _variable) in enumerate(fulfillment_keys)
+        if subdomain_id != "__project__"
+    )
+    leaf_support_masks = {
+        slot.index: tuple(
+            sum(
+                (1 << leaf_index)
+                for leaf_index, key_index in enumerate(leaf_key_indices)
+                if vector[key_index]
+            )
+            for vector in candidate_support[slot.index]
+        )
+        for slot in slots
+    }
+
+    @lru_cache(maxsize=None)
+    def aggregate_leaf_support_maximum(
+        slot_index: int,
+        remaining_to_select: int,
+        needed_leaf_mask: int,
+    ) -> int:
+        """Return an optimistic remaining leaf-support total.
+
+        The relaxation independently chooses the best candidate in each
+        remaining slot, ignores dates and source identity, and then retains the
+        strongest ``remaining_to_select`` slots. It therefore cannot
+        underestimate achievable support and is safe for infeasibility pruning.
+        """
+
+        slot_maxima = []
+        for future_slot in slots[slot_index:]:
+            maximum = max(
+                (
+                    (mask & needed_leaf_mask).bit_count()
+                    for mask in leaf_support_masks[future_slot.index]
+                ),
+                default=0,
+            )
+            if maximum:
+                slot_maxima.append(maximum)
+        slot_maxima.sort(reverse=True)
+        return sum(slot_maxima[:remaining_to_select])
 
     def compatible(
         candidate: Candidate,
@@ -617,6 +727,54 @@ def _select_schedule_path(
         return best
 
     zero_misses = (0,) * len(fulfillment_keys)
+    prune_counts = {
+        "temporal_prunes": 0,
+        "support_prunes": 0,
+        "source_prunes": 0,
+    }
+
+    def remaining_support_is_possible(
+        slot_index: int,
+        misses: tuple[int, ...],
+        remaining_to_select: int,
+    ) -> bool:
+        support_so_far = tuple(
+            feasible - missed
+            for feasible, missed in zip(
+                feasible_prefix[slot_index],
+                misses,
+                strict=True,
+            )
+        )
+        remaining_required = tuple(
+            max(0, required - retained)
+            for required, retained in zip(
+                required_support,
+                support_so_far,
+                strict=True,
+            )
+        )
+        if any(
+            needed > remaining_to_select
+            or needed > future_key_slot_maxima[slot_index][key_index]
+            for key_index, needed in enumerate(remaining_required)
+        ):
+            return False
+
+        total_leaf_required = sum(
+            remaining_required[key_index]
+            for key_index in leaf_key_indices
+        )
+        needed_leaf_mask = sum(
+            1 << leaf_index
+            for leaf_index, key_index in enumerate(leaf_key_indices)
+            if remaining_required[key_index]
+        )
+        return total_leaf_required <= aggregate_leaf_support_maximum(
+            slot_index,
+            remaining_to_select,
+            needed_leaf_mask,
+        )
 
     @lru_cache(maxsize=None)
     def search(
@@ -625,18 +783,41 @@ def _select_schedule_path(
         previous_slot_selected: bool,
         misses: tuple[int, ...],
         remaining_to_select: int,
+        used_fsc_sources: frozenset[str],
     ) -> tuple[tuple[Slot, Candidate], ...] | None:
-        if remaining_to_select < 0 or temporal_maximum(
+        if remaining_to_select < 0:
+            return None
+        if temporal_maximum(
             slot_index,
             last_ordinal,
             previous_slot_selected,
         ) < remaining_to_select:
+            prune_counts["temporal_prunes"] += 1
+            return None
+        if not remaining_support_is_possible(
+            slot_index,
+            misses,
+            remaining_to_select,
+        ):
+            prune_counts["support_prunes"] += 1
+            return None
+        unique_source_capacity = (
+            future_non_fsc_candidate_slots[slot_index]
+            + len(future_fsc_sources[slot_index] - used_fsc_sources)
+        )
+        if unique_source_capacity < remaining_to_select:
+            prune_counts["source_prunes"] += 1
             return None
         if slot_index == len(slots):
             return () if remaining_to_select == 0 else None
         slot = slots[slot_index]
         for candidate in ranked_options[slot.index]:
             if not compatible(candidate, last_ordinal, previous_slot_selected):
+                continue
+            if (
+                candidate.variable == "scf"
+                and candidate.source_file in used_fsc_sources
+            ):
                 continue
             added_misses = _candidate_misses(
                 candidate,
@@ -658,6 +839,11 @@ def _select_schedule_path(
                 True,
                 updated_misses,
                 remaining_to_select - 1,
+                (
+                    used_fsc_sources | {candidate.source_file}
+                    if candidate.variable == "scf"
+                    else used_fsc_sources
+                ),
             )
             if suffix is not None:
                 return ((slot, candidate), *suffix)
@@ -675,6 +861,7 @@ def _select_schedule_path(
                 False,
                 skipped_misses,
                 remaining_to_select,
+                used_fsc_sources,
             )
             if suffix is not None:
                 return suffix
@@ -683,7 +870,14 @@ def _select_schedule_path(
     maximum_selected = temporal_maximum(0, None, False)
     selected_path = None
     for selected_count in range(maximum_selected, minimum_selected - 1, -1):
-        selected_path = search(0, None, False, zero_misses, selected_count)
+        selected_path = search(
+            0,
+            None,
+            False,
+            zero_misses,
+            selected_count,
+            frozenset(),
+        )
         if selected_path is not None:
             break
     if diagnostics is not None:
@@ -692,6 +886,7 @@ def _select_schedule_path(
             constraint_states=search.cache_info().currsize,
             maximum_selected=maximum_selected,
             selected_count=0 if selected_path is None else len(selected_path),
+            **prune_counts,
         )
     if selected_path is None:
         raise ValueError(

@@ -7,6 +7,7 @@ import sys
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
@@ -88,6 +89,79 @@ def _roles() -> tuple[dict[str, object], ...]:
         {"station_id": "a", "subdomain_id": "A", "role": "da"},
         {"station_id": "b", "subdomain_id": "B", "role": "da"},
     )
+
+
+def _large_search_inputs(
+    *,
+    center_supports_all: bool,
+) -> tuple[
+    SchedulePolicy,
+    date,
+    date,
+    list[dict[str, object]],
+    list[dict[str, object]],
+    tuple[dict[str, object], ...],
+]:
+    policy = _policy()
+    start = date(2022, 10, 1)
+    end = date(2023, 9, 30)
+    slots = generate_slots(start, end, policy)
+    domains = tuple(f"D{index}" for index in range(8))
+    fsc_rows: list[dict[str, object]] = []
+    snow_rows: list[dict[str, object]] = []
+    roles: dict[str, dict[str, object]] = {}
+    for slot in slots:
+        for offset, label in ((-1, "left"), (0, "center"), (1, "right")):
+            candidate_date = slot.target_date + timedelta(days=offset)
+            excluded = (
+                None
+                if center_supports_all and offset == 0
+                else domains[(slot.index + offset + 1) % len(domains)]
+            )
+            if slot.variable == "scf":
+                for domain in domains:
+                    supported = domain != excluded
+                    if supported and offset:
+                        valid, cloud, invalid = 85, 10, 5
+                    elif supported:
+                        valid, cloud, invalid = 70, 15, 15
+                    else:
+                        valid, cloud, invalid = 60, 10, 30
+                    fsc_rows.append(
+                        {
+                            "date": candidate_date.isoformat(),
+                            "subdomain_id": domain,
+                            "source_file": f"scene_{candidate_date}.nc",
+                            "pixel_count": 100,
+                            "valid_count": valid,
+                            "cloud_count": cloud,
+                            "nodata_count": invalid,
+                            "water_count": 0,
+                            "water_mask_stable": True,
+                            "uncertainty_valid_fsc_count": valid,
+                            "uncertainty_mean": 10.0,
+                            "uncertainty_p90": 12.0,
+                        }
+                    )
+                continue
+            for domain in domains:
+                if domain == excluded:
+                    continue
+                for copy in range(2 if offset else 1):
+                    station_id = f"{label}_{domain}_{copy}"
+                    roles[station_id] = {
+                        "station_id": station_id,
+                        "subdomain_id": domain,
+                        "role": "da",
+                    }
+                    snow_rows.append(
+                        _snow(
+                            f"{candidate_date} 00:00:00",
+                            station_id,
+                            domain,
+                        )
+                    )
+    return policy, start, end, fsc_rows, snow_rows, tuple(roles.values())
 
 
 def test_versioned_policy_loads_the_fixed_v2_contract() -> None:
@@ -211,6 +285,43 @@ def test_fsc_ranking_prefers_valid_support_then_uncertainty_and_offset() -> None
     assert result.events[0]["valid_support_count"] == 180
 
 
+def test_fsc_source_uniqueness_backtracks_to_the_available_path() -> None:
+    rows = [
+        *_fsc("2022-10-07", cloud=5, invalid=5),
+        *_fsc("2022-10-08", cloud=10, invalid=10),
+        *_fsc("2022-10-13", cloud=5, invalid=5),
+        *_fsc("2022-10-19", cloud=5, invalid=5),
+    ]
+    for row in rows:
+        day = str(row["date"])
+        row["source_file"] = (
+            "shared_scene.nc"
+            if day in {"2022-10-07", "2022-10-13"}
+            else f"unique_{day}.nc"
+        )
+
+    result = schedule_events(
+        policy=replace(
+            _policy(),
+            sequence=("scf",),
+            interval_end=(10, 19),
+        ),
+        fsc_rows=rows,
+        snow_rows=[],
+        station_roles=(),
+        start=date(2022, 10, 1),
+        end=date(2022, 10, 31),
+    )
+
+    assert [event["selected_date"] for event in result.events] == [
+        "2022-10-08",
+        "2022-10-13",
+        "2022-10-19",
+    ]
+    sources = [str(event["source_file"]) for event in result.events]
+    assert len(sources) == len(set(sources)) == 3
+
+
 def test_leaf_type_fulfillment_fails_when_no_common_schedule_can_reach_85_percent() -> None:
     policy = replace(_policy(), interval_end=(10, 7))
     first = _fsc("2022-10-06")
@@ -290,65 +401,10 @@ def test_scheduler_preserves_leaf_fulfillment_counterexample() -> None:
 def test_alternating_50_slot_eight_leaf_search_remains_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    policy = _policy()
-    start = date(2022, 10, 1)
-    end = date(2023, 9, 30)
+    policy, start, end, fsc_rows, snow_rows, roles = _large_search_inputs(
+        center_supports_all=True,
+    )
     slots = generate_slots(start, end, policy)
-    domains = tuple(f"D{index}" for index in range(8))
-    fsc_rows: list[dict[str, object]] = []
-    snow_rows: list[dict[str, object]] = []
-    roles: dict[str, dict[str, object]] = {}
-    for slot in slots:
-        for offset, label in ((-1, "left"), (0, "center"), (1, "right")):
-            candidate_date = slot.target_date + timedelta(days=offset)
-            excluded = (
-                None
-                if offset == 0
-                else domains[(slot.index + int(offset > 0)) % len(domains)]
-            )
-            if slot.variable == "scf":
-                for domain in domains:
-                    supported = domain != excluded
-                    if supported and offset:
-                        valid, cloud, invalid = 85, 10, 5
-                    elif supported:
-                        valid, cloud, invalid = 70, 15, 15
-                    else:
-                        valid, cloud, invalid = 60, 10, 30
-                    fsc_rows.append(
-                        {
-                            "date": candidate_date.isoformat(),
-                            "subdomain_id": domain,
-                            "source_file": f"scene_{candidate_date}.nc",
-                            "pixel_count": 100,
-                            "valid_count": valid,
-                            "cloud_count": cloud,
-                            "nodata_count": invalid,
-                            "water_count": 0,
-                            "water_mask_stable": True,
-                            "uncertainty_valid_fsc_count": valid,
-                            "uncertainty_mean": 10.0,
-                            "uncertainty_p90": 12.0,
-                        }
-                    )
-                continue
-            for domain in domains:
-                if domain == excluded:
-                    continue
-                for copy in range(2 if offset else 1):
-                    station_id = f"{label}_{domain}_{copy}"
-                    roles[station_id] = {
-                        "station_id": station_id,
-                        "subdomain_id": domain,
-                        "role": "da",
-                    }
-                    snow_rows.append(
-                        _snow(
-                            f"{candidate_date} 00:00:00",
-                            station_id,
-                            domain,
-                        )
-                    )
 
     diagnostics: dict[str, int] = {}
     original = scheduler._select_schedule_path
@@ -362,7 +418,7 @@ def test_alternating_50_slot_eight_leaf_search_remains_bounded(
         policy=policy,
         fsc_rows=fsc_rows,
         snow_rows=snow_rows,
-        station_roles=tuple(roles.values()),
+        station_roles=roles,
         start=start,
         end=end,
     )
@@ -370,6 +426,38 @@ def test_alternating_50_slot_eight_leaf_search_remains_bounded(
     assert len(slots) == len(result.events) == 50
     assert diagnostics["constraint_states"] <= 100
     assert diagnostics["temporal_states"] <= 5_000
+
+
+def test_infeasible_50_slot_eight_leaf_search_rejects_within_two_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy, start, end, fsc_rows, snow_rows, roles = _large_search_inputs(
+        center_supports_all=False,
+    )
+    diagnostics: dict[str, int] = {}
+    original = scheduler._select_schedule_path
+
+    def select_with_diagnostics(**kwargs: object) -> tuple[tuple[object, object], ...]:
+        kwargs["diagnostics"] = diagnostics
+        return original(**kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(scheduler, "_select_schedule_path", select_with_diagnostics)
+
+    started = perf_counter()
+    with pytest.raises(ValueError, match="feasible-slot fulfillment"):
+        schedule_events(
+            policy=policy,
+            fsc_rows=fsc_rows,
+            snow_rows=snow_rows,
+            station_roles=roles,
+            start=start,
+            end=end,
+        )
+    elapsed = perf_counter() - started
+
+    assert elapsed < 2.0
+    assert diagnostics["support_prunes"] >= 1
+    assert diagnostics["constraint_states"] <= 10
 
 
 def test_station_half_timestep_tie_is_rejected() -> None:

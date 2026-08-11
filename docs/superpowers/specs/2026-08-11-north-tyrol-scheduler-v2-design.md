@@ -67,11 +67,17 @@ between leaves. A memoized constraint solver tracks the remaining allowed
 misses for every project/type and leaf/type constraint. It first computes the
 maximum temporally compatible event count, then explores candidates in the
 documented deterministic rank order and backtracks only when a later hard
-constraint requires it. Failed constraint states are memoized. A path that
-overfills one leaf therefore cannot hide a shortfall in another, while the
-50-slot/eight-leaf problem does not retain the combinatorial cross-product of
-all miss vectors. Candidate ranking is applied only within the
-maximum-cardinality schedules that satisfy every hard constraint.
+constraint requires it. FSC source identities are part of that search state,
+so a duplicate scene is skipped or causes backtracking rather than invalidating
+an otherwise recoverable path after selection. Failed constraint states are
+memoized. Safe branch-and-bound checks compare every constraint's remaining
+required support with its remaining-slot maximum and compare total required
+leaf support with the optimistic sum of the strongest remaining candidate
+supports. These relax temporal and source conflicts, so they can reject only
+mathematically impossible branches. A path that overfills one leaf therefore
+cannot hide a shortfall in another, while feasible and infeasible
+50-slot/eight-leaf problems remain bounded. Candidate ranking is applied only
+within the maximum-cardinality schedules that satisfy every hard constraint.
 
 ## Shared station roles
 
