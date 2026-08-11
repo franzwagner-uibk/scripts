@@ -63,11 +63,15 @@ identity. Station-HS choices rank by active DA support and then use the same
 deterministic target-offset and identity fallbacks.
 
 Fulfillment is a hard scheduling constraint, not a score that may be traded
-between leaves. The dynamic program tracks the remaining allowed misses for
-every project/type and leaf/type constraint. Paths with different support
-profiles therefore remain distinct until feasibility is decided; a path that
-overfills one leaf cannot hide a shortfall in another. Quality ranking is
-applied only among schedules that satisfy every hard constraint.
+between leaves. A memoized constraint solver tracks the remaining allowed
+misses for every project/type and leaf/type constraint. It first computes the
+maximum temporally compatible event count, then explores candidates in the
+documented deterministic rank order and backtracks only when a later hard
+constraint requires it. Failed constraint states are memoized. A path that
+overfills one leaf therefore cannot hide a shortfall in another, while the
+50-slot/eight-leaf problem does not retain the combinatorial cross-product of
+all miss vectors. Candidate ranking is applied only within the
+maximum-cardinality schedules that satisfy every hard constraint.
 
 ## Shared station roles
 
@@ -189,8 +193,10 @@ destructive cleanup happens only in staging. Staging failures are marked
 `INCOMPLETE`; the canonical tree remains untouched.
 
 A canonical refresh refuses runtime lock markers, a host model process or a
-container mounted on the setup. Completed results, restart data or model state
-also cause refusal unless the operator explicitly supplies
+container mounted on the setup. Host discovery checks both command arguments
+and `/proc/<pid>/cwd`, so a relative-path run started inside the setup is also
+detected. Completed results, restart data or model state also cause refusal
+unless the operator explicitly supplies
 `--discard-runtime-artifacts` after reviewing the listed paths. That
 acknowledgement never overrides a live process or lock.
 

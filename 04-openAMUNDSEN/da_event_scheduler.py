@@ -9,6 +9,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -474,105 +475,19 @@ def schedule_events(
         )
         for slot in slots
     }
-    zero_misses = (0,) * len(fulfillment_keys)
-    zero_quality = (0,) * 10
-    states: dict[
-        tuple[int | None, bool, tuple[int, ...]],
-        tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]],
-    ] = {
-        (None, False, zero_misses): (zero_quality, ())
-    }
-    for slot in slots:
-        next_states: dict[
-            tuple[int | None, bool, tuple[int, ...]],
-            tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]],
-        ] = {}
-        violated_keys: set[tuple[str, str]] = set()
-        for (last_ordinal, previous_slot_selected, misses), (quality_score, path) in states.items():
-            skipped_misses = tuple(
-                current + int(feasible)
-                for current, feasible in zip(misses, slot_feasibility[slot.index], strict=True)
-            )
-            skip_violations = {
-                key
-                for key, current, allowance in zip(
-                    fulfillment_keys,
-                    skipped_misses,
-                    miss_allowances,
-                    strict=True,
-                )
-                if current > allowance
-            }
-            violated_keys.update(skip_violations)
-            if not skip_violations:
-                _keep_constraint_state(
-                    next_states,
-                    (last_ordinal, False, skipped_misses),
-                    quality_score,
-                    path,
-                )
-            for candidate in options_by_slot[slot.index]:
-                delta = abs((candidate.selected_date - slot.target_date).days)
-                ordinal = candidate.selected_date.toordinal()
-                if last_ordinal is not None and ordinal <= last_ordinal:
-                    continue
-                if last_ordinal is not None:
-                    gap = ordinal - last_ordinal
-                    if gap < policy.minimum_gap_days:
-                        continue
-                    if previous_slot_selected and gap > policy.maximum_gap_days:
-                        continue
-                added_misses = _candidate_misses(
-                    candidate,
-                    fulfillment_keys,
-                    slot_feasibility[slot.index],
-                )
-                updated_misses = tuple(
-                    current + added
-                    for current, added in zip(misses, added_misses, strict=True)
-                )
-                candidate_violations = {
-                    key
-                    for key, current, allowance in zip(
-                        fulfillment_keys,
-                        updated_misses,
-                        miss_allowances,
-                        strict=True,
-                    )
-                    if current > allowance
-                }
-                violated_keys.update(candidate_violations)
-                if candidate_violations:
-                    continue
-                candidate_quality = _candidate_quality(candidate, delta)
-                updated_quality = tuple(
-                    left + right
-                    for left, right in zip(quality_score, candidate_quality, strict=True)
-                )
-                _keep_constraint_state(
-                    next_states,
-                    (ordinal, True, updated_misses),
-                    updated_quality,
-                    path + ((slot, candidate),),
-                )
-        states = next_states
-        if not states:
-            constraints = ", ".join(
-                f"{'project' if subdomain_id == '__project__' else subdomain_id} {variable}"
-                for subdomain_id, variable in sorted(violated_keys)
-            ) or "configured per-project and per-subdomain/type"
-            raise ValueError(
-                "No event schedule satisfies all per-project and per-subdomain/type feasible-slot "
-                f"fulfillment constraints of {policy.minimum_fulfillment:.1%} together with the global "
-                f"date and gap constraints. Search exhausted at slot {slot.index}; rejected paths "
-                f"exceeded one or more of: {constraints}"
-            )
-    _, (_, selected_path) = max(
-        states.items(),
-        key=lambda item: (
-            item[1][0],
-            _path_tie_key(item[1][1]),
-        ),
+    minimum_selected = sum(
+        math.ceil(policy.minimum_fulfillment * feasible_counts[key])
+        for key in fulfillment_keys
+        if key[0] == "__project__"
+    )
+    selected_path = _select_schedule_path(
+        slots=slots,
+        options_by_slot=options_by_slot,
+        fulfillment_keys=fulfillment_keys,
+        miss_allowances=miss_allowances,
+        slot_feasibility=slot_feasibility,
+        minimum_selected=minimum_selected,
+        policy=policy,
     )
     selected_by_slot = {slot.index: candidate for slot, candidate in selected_path}
     events: list[dict[str, Any]] = []
@@ -632,23 +547,159 @@ def schedule_events(
     return ScheduleResult(slots, targets, tuple(events), tuple(quality), tuple(exceptions), summary)
 
 
-def _keep_constraint_state(
-    states: dict[
-        tuple[int | None, bool, tuple[int, ...]],
-        tuple[tuple[int, ...], tuple[tuple[Slot, Candidate], ...]],
-    ],
-    key: tuple[int | None, bool, tuple[int, ...]],
-    quality_score: tuple[int, ...],
-    path: tuple[tuple[Slot, Candidate], ...],
-) -> None:
-    """Keep the best additive quality path for one exact constraint state."""
+def _select_schedule_path(
+    *,
+    slots: Sequence[Slot],
+    options_by_slot: Mapping[int, Sequence[Candidate]],
+    fulfillment_keys: Sequence[tuple[str, str]],
+    miss_allowances: tuple[int, ...],
+    slot_feasibility: Mapping[int, Sequence[bool]],
+    minimum_selected: int,
+    policy: SchedulePolicy,
+    diagnostics: dict[str, int] | None = None,
+) -> tuple[tuple[Slot, Candidate], ...]:
+    """Find the maximum-cardinality feasible path in deterministic rank order."""
 
-    existing = states.get(key)
-    if existing is None or (quality_score, _path_tie_key(path)) > (
-        existing[0],
-        _path_tie_key(existing[1]),
-    ):
-        states[key] = (quality_score, path)
+    ranked_options = {
+        slot.index: tuple(
+            sorted(
+                options_by_slot[slot.index],
+                key=lambda candidate: (
+                    _candidate_quality(
+                        candidate,
+                        abs((candidate.selected_date - slot.target_date).days),
+                    ),
+                    candidate.selected_timestamp.isoformat(),
+                    candidate.source_file,
+                    candidate.supported_subdomains,
+                    candidate.active_station_ids,
+                ),
+                reverse=True,
+            )
+        )
+        for slot in slots
+    }
+
+    def compatible(
+        candidate: Candidate,
+        last_ordinal: int | None,
+        previous_slot_selected: bool,
+    ) -> bool:
+        if last_ordinal is None:
+            return True
+        ordinal = candidate.selected_date.toordinal()
+        gap = ordinal - last_ordinal
+        return gap >= policy.minimum_gap_days and (
+            not previous_slot_selected or gap <= policy.maximum_gap_days
+        )
+
+    @lru_cache(maxsize=None)
+    def temporal_maximum(
+        slot_index: int,
+        last_ordinal: int | None,
+        previous_slot_selected: bool,
+    ) -> int:
+        if slot_index == len(slots):
+            return 0
+        slot = slots[slot_index]
+        best = temporal_maximum(slot_index + 1, last_ordinal, False)
+        for candidate in ranked_options[slot.index]:
+            if compatible(candidate, last_ordinal, previous_slot_selected):
+                best = max(
+                    best,
+                    1
+                    + temporal_maximum(
+                        slot_index + 1,
+                        candidate.selected_date.toordinal(),
+                        True,
+                    ),
+                )
+        return best
+
+    zero_misses = (0,) * len(fulfillment_keys)
+
+    @lru_cache(maxsize=None)
+    def search(
+        slot_index: int,
+        last_ordinal: int | None,
+        previous_slot_selected: bool,
+        misses: tuple[int, ...],
+        remaining_to_select: int,
+    ) -> tuple[tuple[Slot, Candidate], ...] | None:
+        if remaining_to_select < 0 or temporal_maximum(
+            slot_index,
+            last_ordinal,
+            previous_slot_selected,
+        ) < remaining_to_select:
+            return None
+        if slot_index == len(slots):
+            return () if remaining_to_select == 0 else None
+        slot = slots[slot_index]
+        for candidate in ranked_options[slot.index]:
+            if not compatible(candidate, last_ordinal, previous_slot_selected):
+                continue
+            added_misses = _candidate_misses(
+                candidate,
+                fulfillment_keys,
+                slot_feasibility[slot.index],
+            )
+            updated_misses = tuple(
+                current + added
+                for current, added in zip(misses, added_misses, strict=True)
+            )
+            if any(
+                current > allowance
+                for current, allowance in zip(updated_misses, miss_allowances, strict=True)
+            ):
+                continue
+            suffix = search(
+                slot_index + 1,
+                candidate.selected_date.toordinal(),
+                True,
+                updated_misses,
+                remaining_to_select - 1,
+            )
+            if suffix is not None:
+                return ((slot, candidate), *suffix)
+        skipped_misses = tuple(
+            current + int(feasible)
+            for current, feasible in zip(misses, slot_feasibility[slot.index], strict=True)
+        )
+        if all(
+            current <= allowance
+            for current, allowance in zip(skipped_misses, miss_allowances, strict=True)
+        ):
+            suffix = search(
+                slot_index + 1,
+                last_ordinal,
+                False,
+                skipped_misses,
+                remaining_to_select,
+            )
+            if suffix is not None:
+                return suffix
+        return None
+
+    maximum_selected = temporal_maximum(0, None, False)
+    selected_path = None
+    for selected_count in range(maximum_selected, minimum_selected - 1, -1):
+        selected_path = search(0, None, False, zero_misses, selected_count)
+        if selected_path is not None:
+            break
+    if diagnostics is not None:
+        diagnostics.update(
+            temporal_states=temporal_maximum.cache_info().currsize,
+            constraint_states=search.cache_info().currsize,
+            maximum_selected=maximum_selected,
+            selected_count=0 if selected_path is None else len(selected_path),
+        )
+    if selected_path is None:
+        raise ValueError(
+            "No event schedule satisfies all per-project and per-subdomain/type feasible-slot "
+            f"fulfillment constraints of {policy.minimum_fulfillment:.1%} together with the global "
+            "date and gap constraints"
+        )
+    return selected_path
 
 
 def _candidate_misses(
@@ -687,10 +738,6 @@ def _candidate_quality(candidate: Candidate, delta: int) -> tuple[int, ...]:
         -delta,
         -candidate.selected_date.toordinal(),
     )
-
-
-def _path_tie_key(path: Sequence[tuple[Slot, Candidate]]) -> tuple[str, ...]:
-    return tuple(f"{candidate.selected_timestamp.isoformat()}:{candidate.source_file}" for _, candidate in path)
 
 
 def _fsc_candidates(rows: Sequence[Mapping[str, Any]], policy: SchedulePolicy) -> tuple[Candidate, ...]:

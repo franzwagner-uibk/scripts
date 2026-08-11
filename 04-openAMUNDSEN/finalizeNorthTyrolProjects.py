@@ -758,15 +758,28 @@ def _active_model_references(root: Path) -> list[str]:
     if process_table.returncode:
         raise RuntimeError(f"Cannot inspect host processes: {process_table.stderr.strip()}")
     root_text = str(root)
+    model_markers = (
+        "openamundsen-da run",
+        "openamundsen-da subdomains run",
+        "openamundsen_da.pipeline",
+    )
     for line in process_table.stdout.splitlines():
-        lowered = line.lower()
-        model_markers = (
-            "openamundsen-da run",
-            "openamundsen-da subdomains run",
-            "openamundsen_da.pipeline",
-        )
-        if root_text in line and any(marker in lowered for marker in model_markers):
-            references.append(f"host process {line.strip()}")
+        stripped = line.strip()
+        pid_text, separator, arguments = stripped.partition(" ")
+        if not separator or not pid_text.isdigit():
+            continue
+        lowered = arguments.lower()
+        if not any(marker in lowered for marker in model_markers):
+            continue
+        cwd: Path | None = None
+        try:
+            cwd = Path(f"/proc/{pid_text}/cwd").resolve(strict=True)
+        except OSError:
+            pass
+        cwd_inside_setup = cwd is not None and _path_is_within(cwd, root)
+        if root_text in arguments or cwd_inside_setup:
+            suffix = f" cwd={cwd}" if cwd_inside_setup else ""
+            references.append(f"host process {stripped}{suffix}")
 
     container_ids = subprocess.run(
         ["docker", "ps", "-q"],
@@ -789,20 +802,25 @@ def _active_model_references(root: Path) -> list[str]:
         for container in json.loads(inspected.stdout):
             container_name = str(container.get("Name", "")).lstrip("/")
             for mount in container.get("Mounts") or []:
-                source = Path(str(mount.get("Source", "")))
-                try:
-                    source.resolve().relative_to(root)
-                    overlaps = True
-                except (OSError, ValueError):
-                    try:
-                        root.relative_to(source.resolve())
-                        overlaps = True
-                    except (OSError, ValueError):
-                        overlaps = False
+                source_text = str(mount.get("Source", "")).strip()
+                if not source_text:
+                    continue
+                source = Path(source_text)
+                overlaps = _path_is_within(source, root) or _path_is_within(root, source)
                 if overlaps:
                     references.append(f"Docker container {container_name or container.get('Id', '')}")
                     break
     return sorted(set(references))
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    """Return whether a resolved path is equal to or below a resolved parent."""
+
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _canonical_copy_ignore(directory: str, names: list[str]) -> set[str]:

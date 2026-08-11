@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
@@ -14,6 +15,7 @@ MODULE_ROOT = Path(__file__).resolve().parents[1]
 if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 
+import da_event_scheduler as scheduler  # noqa: E402
 import finalizeNorthTyrolProjects as finalizer  # noqa: E402
 from da_event_scheduler import (  # noqa: E402
     SchedulePolicy,
@@ -215,7 +217,7 @@ def test_leaf_type_fulfillment_fails_when_no_common_schedule_can_reach_85_percen
     second = _fsc("2022-10-08")
     first[1].update({"valid_count": 69, "cloud_count": 10, "nodata_count": 21, "uncertainty_valid_fsc_count": 69})
     second[0].update({"valid_count": 69, "cloud_count": 10, "nodata_count": 21, "uncertainty_valid_fsc_count": 69})
-    with pytest.raises(ValueError, match=r"feasible-slot fulfillment.*Search exhausted"):
+    with pytest.raises(ValueError, match=r"feasible-slot fulfillment.*date and gap constraints"):
         schedule_events(
             policy=policy,
             fsc_rows=[*first, *second],
@@ -283,6 +285,91 @@ def test_scheduler_preserves_leaf_fulfillment_counterexample() -> None:
         domain: result.summary["by_subdomain"][domain]["scf"]["retained"]
         for domain in ("A", "B", "C")
     } == {"A": 6, "B": 5, "C": 3}
+
+
+def test_alternating_50_slot_eight_leaf_search_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy()
+    start = date(2022, 10, 1)
+    end = date(2023, 9, 30)
+    slots = generate_slots(start, end, policy)
+    domains = tuple(f"D{index}" for index in range(8))
+    fsc_rows: list[dict[str, object]] = []
+    snow_rows: list[dict[str, object]] = []
+    roles: dict[str, dict[str, object]] = {}
+    for slot in slots:
+        for offset, label in ((-1, "left"), (0, "center"), (1, "right")):
+            candidate_date = slot.target_date + timedelta(days=offset)
+            excluded = (
+                None
+                if offset == 0
+                else domains[(slot.index + int(offset > 0)) % len(domains)]
+            )
+            if slot.variable == "scf":
+                for domain in domains:
+                    supported = domain != excluded
+                    if supported and offset:
+                        valid, cloud, invalid = 85, 10, 5
+                    elif supported:
+                        valid, cloud, invalid = 70, 15, 15
+                    else:
+                        valid, cloud, invalid = 60, 10, 30
+                    fsc_rows.append(
+                        {
+                            "date": candidate_date.isoformat(),
+                            "subdomain_id": domain,
+                            "source_file": f"scene_{candidate_date}.nc",
+                            "pixel_count": 100,
+                            "valid_count": valid,
+                            "cloud_count": cloud,
+                            "nodata_count": invalid,
+                            "water_count": 0,
+                            "water_mask_stable": True,
+                            "uncertainty_valid_fsc_count": valid,
+                            "uncertainty_mean": 10.0,
+                            "uncertainty_p90": 12.0,
+                        }
+                    )
+                continue
+            for domain in domains:
+                if domain == excluded:
+                    continue
+                for copy in range(2 if offset else 1):
+                    station_id = f"{label}_{domain}_{copy}"
+                    roles[station_id] = {
+                        "station_id": station_id,
+                        "subdomain_id": domain,
+                        "role": "da",
+                    }
+                    snow_rows.append(
+                        _snow(
+                            f"{candidate_date} 00:00:00",
+                            station_id,
+                            domain,
+                        )
+                    )
+
+    diagnostics: dict[str, int] = {}
+    original = scheduler._select_schedule_path
+
+    def select_with_diagnostics(**kwargs: object) -> tuple[tuple[object, object], ...]:
+        kwargs["diagnostics"] = diagnostics
+        return original(**kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(scheduler, "_select_schedule_path", select_with_diagnostics)
+    result = schedule_events(
+        policy=policy,
+        fsc_rows=fsc_rows,
+        snow_rows=snow_rows,
+        station_roles=tuple(roles.values()),
+        start=start,
+        end=end,
+    )
+
+    assert len(slots) == len(result.events) == 50
+    assert diagnostics["constraint_states"] <= 100
+    assert diagnostics["temporal_states"] <= 5_000
 
 
 def test_station_half_timestep_tie_is_rejected() -> None:
@@ -714,6 +801,55 @@ def test_canonical_runtime_replacement_requires_ack_and_never_ignores_locks(
             tmp_path,
             discard_runtime_artifacts=True,
         )
+
+
+def test_active_model_discovery_resolves_process_cwd_for_relative_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_root = tmp_path / "setup"
+    setup_root.mkdir()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "openamundsen-da",
+            "run",
+        ],
+        cwd=setup_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def run_without_docker(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ["ps", "-eo"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=f"{process.pid} python relative-command openamundsen-da run\n",
+                stderr="",
+            )
+        if command[:3] == ["docker", "ps", "-q"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr(finalizer.subprocess, "run", run_without_docker)
+    try:
+        references = finalizer._active_model_references(setup_root)
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert any(f"host process {process.pid}" in reference for reference in references)
+    assert any(f"cwd={setup_root.resolve()}" in reference for reference in references)
 
 
 def test_failed_canonical_refresh_keeps_source_and_marks_staging_incomplete(

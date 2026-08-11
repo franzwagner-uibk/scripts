@@ -36,9 +36,10 @@ versioned at `policies/north_tyrol_alternating_6day_v2.yml`. It uses alternating
 FSC and station-HS targets every six days from October 7 through July 31. FSC
 selection uses a stable reference footprint that excludes water and pixels that
 are nodata throughout the selected archive. The water mask must be identical in
-every retained scene; variability fails instead of being inferred. A domain passes with at most 20%
-cloud, at most 20% non-cloud invalid pixels, at least one valid pixel and finite
-uncertainty for every valid pixel. Candidate scenes rank by valid support,
+every retained scene; variability fails instead of being inferred. A domain
+passes with at most 20% cloud, at most 20% non-cloud invalid pixels, at least
+one valid pixel and finite uncertainty for every valid pixel. Candidate scenes
+rank by valid support,
 uncertainty p90 and mean, target offset and date after the project and leaf
 fulfillment constraints are satisfied.
 
@@ -50,6 +51,12 @@ time; for this 3 h setup the inclusive tolerance is 1.5 h. A missing slot
 remains an explicit exception and does not alter later slot types. Each
 observation type must fill at least 85% of its feasible annual targets in the
 top-level project and in every leaf with feasible support.
+
+The scheduler treats those fulfillment limits as hard constraints. It
+maximizes the temporally compatible retained-event count, then resolves the
+maximum-cardinality feasible schedule in deterministic per-target candidate
+rank order with memoized backtracking. This preserves leaf-specific support
+without materializing the combinatorial cross-product of all leaf miss counts.
 
 To inspect a normalized inventory without creating output:
 
@@ -80,8 +87,10 @@ It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
 
 Canonical refresh refuses runtime locks, live model processes and containers
-mounted on the setup. It also refuses completed results, restart data or model
-state by default. After the listed runtime artifacts have been reviewed, the
+mounted on the setup. Host checks inspect both process arguments and
+`/proc/<pid>/cwd`, including relative-path commands started inside the setup.
+It also refuses completed results, restart data or model state by default.
+After the listed runtime artifacts have been reviewed, the
 explicit `--discard-runtime-artifacts` option authorizes their replacement in
 the staged transaction; it never overrides a live lock or process.
 
