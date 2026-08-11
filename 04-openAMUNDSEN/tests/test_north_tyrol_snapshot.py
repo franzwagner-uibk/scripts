@@ -35,6 +35,8 @@ from north_tyrol_snapshot import (  # noqa: E402
     preflight,
     project_configuration,
     setup_configuration,
+    summarize_fsc_quality,
+    update_fsc_archive_support,
     validate_options,
     write_json,
     write_pending_projects,
@@ -80,6 +82,32 @@ def test_fsc_classification_is_mutually_exclusive_and_complete() -> None:
 
 def test_fsc_classification_reports_unknown_values() -> None:
     assert classify_fsc(np.array([150.0]))["unknown"].tolist() == [True]
+
+
+def test_fsc_quality_excludes_water_and_permanently_unsupported_pixels() -> None:
+    archive_support = None
+    archive_support = update_fsc_archive_support(
+        archive_support,
+        np.array([np.nan, 0.0, 50.0, 210.0]),
+    )
+    archive_support = update_fsc_archive_support(
+        archive_support,
+        np.array([np.nan, 215.0, 50.0, 210.0]),
+    )
+    quality = summarize_fsc_quality(
+        np.array([np.nan, 215.0, 50.0, 210.0]),
+        np.array([np.nan, np.nan, 7.0, np.nan]),
+        np.ones(4, dtype=bool),
+        archive_support,
+    )
+
+    assert quality["pixel_count"] == 4
+    assert quality["permanent_nodata_count"] == 1
+    assert quality["water_count"] == 1
+    assert quality["reference_count"] == 2
+    assert quality["valid_count"] == 1
+    assert quality["nodata_count"] == 1
+    assert quality["uncertainty_valid_fsc_count"] == 1
 
 
 def test_ascii_crop_window_aligns_to_original_cells() -> None:
@@ -235,6 +263,8 @@ def test_setup_configuration_parses_with_pinned_openamundsen() -> None:
     grid_variables = config["output_data"]["grids"]["variables"]
 
     assert {"var": "snow.depth", "name": "snowdepth_instantaneous"} in grid_variables
+    assert {"var": "snow.depth", "name": "snowdepth_daily", "freq": "D"} in grid_variables
+    assert {"var": "snow.swe", "name": "swe_daily", "freq": "D"} in grid_variables
 
     parsed = openamundsen.parse_config(config)
 

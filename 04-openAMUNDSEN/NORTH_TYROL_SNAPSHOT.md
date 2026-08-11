@@ -31,25 +31,32 @@ been reviewed.
 ## Event scheduling and finalization
 
 `scheduleDAEvents.py` is the generic interface to the pure normalized-table
-scheduler in `da_event_scheduler.py`. The North Tyrol policy is versioned at
-`policies/north_tyrol_alternating_6day_v1.yml`. It uses alternating FSC and
-station-HS targets every six days from October 7 through July 31, deterministic
-observation matching, a 20% FSC cloud threshold and a shared elevation-aware
-station split.
+scheduler in `da_event_scheduler.py`. The current North Tyrol policy is
+versioned at `policies/north_tyrol_alternating_6day_v2.yml`. It uses alternating
+FSC and station-HS targets every six days from October 7 through July 31. FSC
+selection uses a stable reference footprint that excludes water and pixels that
+are nodata throughout the selected archive. A domain passes with at most 20%
+cloud, at most 20% non-cloud invalid pixels, at least one valid pixel and finite
+uncertainty for every valid pixel. Candidate scenes rank by valid support,
+uncertainty p90 and mean, target offset and date after the project and leaf
+fulfillment constraints are satisfied.
 
 The fixed targets are not moved. FSC and station observations are matched
 within four days so retained adjacent slots can satisfy the five-to-seven-day
-gap contract despite irregular acquisitions. A missing slot remains an explicit
-exception and does not alter later slot types. Each observation type must fill
-at least 85% of its 25 annual targets.
+gap contract despite irregular acquisitions. Station observations are matched
+uniquely within half the model timestep of the configured daily assimilation
+time; for this 3 h setup the inclusive tolerance is 1.5 h. A missing slot
+remains an explicit exception and does not alter later slot types. Each
+observation type must fill at least 85% of its feasible annual targets in the
+top-level project and in every leaf with feasible support.
 
 To inspect a normalized inventory without creating output:
 
 ```bash
 python 04-openAMUNDSEN/scheduleDAEvents.py \
-  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml \
   --fsc-inventory SNAPSHOT/inventories/fsc_scene_subdomain_quality.csv \
-  --snow-inventory SNAPSHOT/inventories/snow_station_daily_support.csv \
+  --snow-inventory SNAPSHOT/inventories/snow_station_timestep_support.csv \
   --station-metadata SNAPSHOT/data_working/obs/stations/stations_snow_depth.csv \
   --start 2022-10-01 \
   --end 2023-09-30 \
@@ -57,13 +64,24 @@ python 04-openAMUNDSEN/scheduleDAEvents.py \
   --preflight
 ```
 
-`finalizeNorthTyrolProjects.py` is the snapshot-specific adapter. Preflight
-verifies the accepted pending state, all recorded raw and working hashes, the
-schedule and the pinned image contract without writing. Normal execution copies
-the full snapshot to a timestamped sibling, creates the ES50 compact-retention
-projects, prepares all eight subdomains per project and validates their steps.
+`finalizeNorthTyrolProjects.py` is the North Tyrol adapter. It accepts both the
+original event-neutral snapshot and the current documentation-shaped canonical
+setup, provided a legacy snapshot contains the exact-timestep station inventory;
+daily station summaries are intentionally not accepted. Preflight is read-only.
+A canonical refresh builds a same-filesystem
+sibling while excluding old derived leaves and runtime artifacts, writes only
+the reviewed final event lists to each project YAML, removes the legacy event
+filter, regenerates all 48 leaves and validates their steps without propagation.
 It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
+
+The refresh writes deterministic target, event, quality, leaf-selection,
+exception and shared-role audits under `raw/metadata/`. It also inventories
+exact forcing flatlines and pairs co-temporal station snow depth with the native
+EURAC pixel and 3x3 neighborhood. These tables support review only; they never
+replace the final `data_assimilation.assimilation_events` lists in project YAML.
+The optional areal FSC audit requires an explicitly approved elevation-band
+width and applies no hidden default.
 
 The accepted source polygons contain small overlaps that v0.9.4 correctly
 refuses. The adapter leaves the hashed working GeoPackage unchanged and derives
@@ -84,9 +102,9 @@ Any `results`, restart state or model artifact fails final acceptance.
 
 ```bash
 python 04-openAMUNDSEN/finalizeNorthTyrolProjects.py \
-  --setup-root /home/franz/workspace/openamundsen_da_runs/north_tyrol_subdomain_runs/north_tyrol_hydro_2017_2023_snapshot_v1 \
-  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v1.yml \
-  --image ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
+  --setup-root /home/franz/workspace/openamundsen_da_runs/north_tyrol_subdomain_runs/north_tyrol_subdomains_100m \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml \
+  --image ghcr.io/openamundsen/openamundsen-da@sha256:REVIEWED_CORE_IMAGE_DIGEST \
   --preflight
 ```
 
