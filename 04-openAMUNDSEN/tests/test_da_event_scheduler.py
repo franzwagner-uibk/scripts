@@ -192,6 +192,7 @@ def test_versioned_policy_v3_adds_fixed_symmetric_tie_contract() -> None:
     assert policy.schema_version == 3
     assert policy.station_matching == "unique_nearest_or_symmetric_mean_within_half_timestep"
     assert policy.symmetric_tie_max_span_hours == 24
+    assert policy.minimum_fulfillment == 0.80
 
 
 def test_slots_quality_gates_and_exact_timestep_selection() -> None:

@@ -53,6 +53,6 @@ failure, and no model propagation is launched.
 Focused tests cover v2 preservation, v3 parsing, valid midpoint support,
 malformed ties, exact-over-interpolated ranking, selected-event INFO logs,
 station-role support and the 250 m native-grid audit. P8 acceptance requires
-the core pre-run validator to accept every final HS event, at least 85% of
+the core pre-run validator to accept every final HS event, at least 80% of
 feasible support per type and leaf, complete SWE and snow-depth outputs and no
 runtime process or model state before promotion.

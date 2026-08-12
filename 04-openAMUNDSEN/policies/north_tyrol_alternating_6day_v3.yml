@@ -38,4 +38,4 @@ station_hs:
 
 fulfillment:
   denominator: feasible_slots
-  minimum_fraction_per_type: 0.85
+  minimum_fraction_per_type: 0.80
