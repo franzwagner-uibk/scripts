@@ -108,8 +108,14 @@ the staged transaction; it never overrides a live lock or process.
 
 The refresh writes deterministic target, event, quality, leaf-selection,
 exception and shared-role audits under `raw/metadata/`. It also inventories
-exact forcing flatlines and pairs co-temporal station snow depth with the native
-EURAC pixel and 3x3 neighborhood. It also writes areal FSC context in fixed
+exact forcing flatlines at each CSV's required hourly source cadence, independent
+of the three-hour model timestep. Timestamp gaps end a plateau. Model-consumed
+fields are retained after 24 hours of exact repetition, with seven-day runs
+marked severe; zero precipitation is classified separately as a dry period.
+The resulting project-window tables are warnings and scientific limitations,
+not instructions to alter, fill or exclude the forcing. The audit also pairs
+co-temporal station snow depth with the native EURAC pixel and 3x3 neighborhood.
+It also writes areal FSC context in fixed
 250 m elevation bands and by land-cover class, assigning native FSC pixels to
 the containing native 100 m DEM and land-cover cell without resampling. These tables support review only; they never
 replace the final `data_assimilation.assimilation_events` lists in project YAML.

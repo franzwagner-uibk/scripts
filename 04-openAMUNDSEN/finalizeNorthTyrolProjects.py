@@ -41,6 +41,17 @@ EXPECTED_SUBDOMAINS = 8
 FINALIZER_SCHEMA_VERSION = 2
 LEGACY_LAYOUT = "legacy_snapshot"
 CANONICAL_LAYOUT = "canonical_setup"
+EXPECTED_FORCING_SOURCE_TIMESTEP = timedelta(hours=1)
+FORCING_FLATLINE_MINIMUM_DURATION = timedelta(hours=24)
+FORCING_FLATLINE_SEVERE_DURATION = timedelta(days=7)
+MODEL_FORCING_VARIABLES = (
+    "precip",
+    "rel_hum",
+    "sw_in",
+    "temp",
+    "wind_dir",
+    "wind_speed",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1170,41 +1181,62 @@ def _write_canonical_refresh_manifest(
     _write_json(root / "raw" / "metadata" / "canonical_refresh_manifest.json", payload)
 
 
-def _write_forcing_flatline_inventory(root: Path, *, minimum_samples: int = 8) -> None:
-    """Inventory exact forcing plateaus without deciding whether they are erroneous."""
+def _write_forcing_flatline_inventory(root: Path) -> None:
+    """Inventory native-cadence forcing plateaus as non-mutating QC evidence."""
 
-    setup = _read_yaml(_canonical_setup_yaml(root))
-    timestep = _duration_value(setup.get("timestep", "3H"))
-    rows: list[dict[str, Any]] = []
-    forcing_files = 0
-    skipped_files: list[str] = []
-    for path in sorted((root / "meteo").glob("*.csv")):
+    project_windows = _canonical_project_windows(root)
+    source_runs: list[dict[str, Any]] = []
+    cadence_rows: list[dict[str, Any]] = []
+    forcing_paths = sorted(path for path in (root / "meteo").glob("*.csv") if path.name != "stations.csv")
+    if len(forcing_paths) != 161:
+        raise ValueError(f"Expected 161 forcing time-series files, got {len(forcing_paths)}")
+    for path in forcing_paths:
         records = read_csv_records(path)
-        file_rows = forcing_flatline_runs(
+        timestamps, cadence = forcing_source_timestamps(
             records,
             station_file=path.name,
-            timestep=timestep,
-            minimum_samples=minimum_samples,
+            expected_timestep=EXPECTED_FORCING_SOURCE_TIMESTEP,
         )
-        if file_rows is None:
-            skipped_files.append(path.name)
-            continue
-        forcing_files += 1
-        rows.extend(file_rows)
-    if forcing_files != 161:
-        raise ValueError(f"Expected 161 forcing time-series files, got {forcing_files}")
+        cadence_rows.append(
+            {
+                "station_file": path.name,
+                "station_id": path.stem,
+                "inferred_source_cadence_hours": cadence.total_seconds() / 3600.0,
+                "timestamp_count": len(timestamps),
+                "first_timestamp": timestamps[0].isoformat(sep=" "),
+                "last_timestamp": timestamps[-1].isoformat(sep=" "),
+                "gap_count": sum(
+                    right - left != cadence for left, right in zip(timestamps, timestamps[1:])
+                ),
+            }
+        )
+        source_runs.extend(
+            forcing_flatline_runs(
+                records,
+                station_file=path.name,
+                expected_timestep=EXPECTED_FORCING_SOURCE_TIMESTEP,
+                minimum_duration=FORCING_FLATLINE_MINIMUM_DURATION,
+            )
+        )
+    rows = clip_forcing_flatline_runs(
+        source_runs,
+        project_windows=project_windows,
+        minimum_duration=FORCING_FLATLINE_MINIMUM_DURATION,
+    )
+    overlaps = forcing_multivariable_overlaps(rows)
+    _validate_eissee_2017_2018_flatline(rows)
     metadata = root / "raw" / "metadata"
+    _write_csv(metadata / "forcing_source_cadence.csv", cadence_rows)
     _write_csv(metadata / "forcing_flatline_runs.csv", rows)
+    _write_csv(metadata / "forcing_flatline_multivariable_overlaps.csv", overlaps)
     _write_json(
         metadata / "forcing_flatline_summary.json",
-        {
-            "definition": "exact equal finite values over consecutive native model timesteps",
-            "minimum_samples": minimum_samples,
-            "forcing_files": forcing_files,
-            "skipped_non_timeseries_files": skipped_files,
-            "run_count": len(rows),
-            "maximum_sample_count": max((int(row["sample_count"]) for row in rows), default=0),
-        },
+        forcing_flatline_summary(
+            rows,
+            overlaps=overlaps,
+            cadence_rows=cadence_rows,
+            project_windows=project_windows,
+        ),
     )
 
 
@@ -1212,27 +1244,18 @@ def forcing_flatline_runs(
     records: Sequence[Mapping[str, Any]],
     *,
     station_file: str,
-    timestep: timedelta,
-    minimum_samples: int,
-) -> list[dict[str, Any]] | None:
-    """Return exact consecutive constant-value runs for one forcing table."""
+    expected_timestep: timedelta = EXPECTED_FORCING_SOURCE_TIMESTEP,
+    minimum_duration: timedelta = FORCING_FLATLINE_MINIMUM_DURATION,
+) -> list[dict[str, Any]]:
+    """Return exact constant-value runs at one forcing table's native cadence."""
 
-    if not records:
-        return None
-    timestamp_field = next(
-        (name for name in ("date", "datetime", "time") if name in records[0]),
-        None,
+    timestamps, source_timestep = forcing_source_timestamps(
+        records,
+        station_file=station_file,
+        expected_timestep=expected_timestep,
     )
-    if timestamp_field is None:
-        return None
-    timestamps = [
-        _naive_datetime(record[timestamp_field], field=f"{station_file}:{timestamp_field}")
-        for record in records
-    ]
-    if any(right <= left for left, right in zip(timestamps, timestamps[1:])):
-        raise ValueError(f"Forcing timestamps are not strictly increasing: {station_file}")
     rows: list[dict[str, Any]] = []
-    variables = sorted(set(records[0]) - {timestamp_field})
+    variables = [variable for variable in MODEL_FORCING_VARIABLES if variable in records[0]]
     for variable in variables:
         run_start = 0
         run_value: float | None = None
@@ -1243,14 +1266,20 @@ def forcing_flatline_runs(
                 and value is not None
                 and run_value is not None
                 and value == run_value
-                and timestamps[index] - timestamps[index - 1] == timestep
+                and timestamps[index] - timestamps[index - 1] == source_timestep
             ) if index < len(records) else False
             if index == run_start:
                 run_value = value
                 continue
             if continues:
                 continue
-            if run_value is not None and index - run_start >= minimum_samples:
+            duration = timestamps[index - 1] - timestamps[run_start]
+            if run_value is not None and duration >= minimum_duration:
+                classification = (
+                    "dry_zero_precip"
+                    if variable == "precip" and run_value == 0.0
+                    else "candidate_stuck_sensor"
+                )
                 rows.append(
                     {
                         "station_file": station_file,
@@ -1260,13 +1289,247 @@ def forcing_flatline_runs(
                         "start_timestamp": timestamps[run_start].isoformat(sep=" "),
                         "end_timestamp": timestamps[index - 1].isoformat(sep=" "),
                         "sample_count": index - run_start,
-                        "duration_hours": (timestamps[index - 1] - timestamps[run_start]).total_seconds() / 3600.0,
+                        "duration_hours": duration.total_seconds() / 3600.0,
+                        "source_timestep_hours": source_timestep.total_seconds() / 3600.0,
                         "zero_value": run_value == 0.0,
+                        "classification": classification,
+                        "severity": (
+                            "severe" if duration >= FORCING_FLATLINE_SEVERE_DURATION else "plateau"
+                        ),
                     }
                 )
             run_start = index
             run_value = value
     return rows
+
+
+def forcing_source_timestamps(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    station_file: str,
+    expected_timestep: timedelta,
+) -> tuple[list[datetime], timedelta]:
+    """Parse timestamps and require the inferred native forcing cadence."""
+
+    if len(records) < 2:
+        raise ValueError(f"Forcing table needs at least two timestamps: {station_file}")
+    timestamp_field = next(
+        (name for name in ("date", "datetime", "time") if name in records[0]),
+        None,
+    )
+    if timestamp_field is None:
+        raise ValueError(f"Forcing table has no timestamp column: {station_file}")
+    timestamps = [
+        _naive_datetime(record[timestamp_field], field=f"{station_file}:{timestamp_field}")
+        for record in records
+    ]
+    deltas = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    if any(delta <= timedelta(0) for delta in deltas):
+        raise ValueError(f"Forcing timestamps are not strictly increasing: {station_file}")
+    delta_counts = Counter(deltas)
+    inferred_timestep = min(
+        delta_counts,
+        key=lambda delta: (-delta_counts[delta], delta),
+    )
+    if inferred_timestep != expected_timestep:
+        raise ValueError(
+            f"Forcing source cadence must be {expected_timestep}, got {inferred_timestep}: {station_file}"
+        )
+    expected_seconds = expected_timestep.total_seconds()
+    if any(delta.total_seconds() % expected_seconds != 0 for delta in deltas):
+        raise ValueError(f"Forcing timestamp gap is not aligned to the hourly source cadence: {station_file}")
+    return timestamps, inferred_timestep
+
+
+def clip_forcing_flatline_runs(
+    source_runs: Sequence[Mapping[str, Any]],
+    *,
+    project_windows: Mapping[str, tuple[datetime, datetime]],
+    minimum_duration: timedelta,
+) -> list[dict[str, Any]]:
+    """Clip native-source flatlines to every overlapping project window."""
+
+    rows: list[dict[str, Any]] = []
+    for source_row in source_runs:
+        source_start = _naive_datetime(source_row["start_timestamp"], field="flatline start")
+        source_end = _naive_datetime(source_row["end_timestamp"], field="flatline end")
+        source_timestep = timedelta(hours=float(source_row["source_timestep_hours"]))
+        for project, (project_start, project_end) in sorted(project_windows.items()):
+            start = max(source_start, project_start)
+            end = min(source_end, project_end)
+            duration = end - start
+            if duration < minimum_duration:
+                continue
+            row = dict(source_row)
+            row.update(
+                {
+                    "project": project,
+                    "source_start_timestamp": source_start.isoformat(sep=" "),
+                    "source_end_timestamp": source_end.isoformat(sep=" "),
+                    "source_sample_count": source_row["sample_count"],
+                    "start_timestamp": start.isoformat(sep=" "),
+                    "end_timestamp": end.isoformat(sep=" "),
+                    "sample_count": int(duration / source_timestep) + 1,
+                    "duration_hours": duration.total_seconds() / 3600.0,
+                    "severity": (
+                        "severe" if duration >= FORCING_FLATLINE_SEVERE_DURATION else "plateau"
+                    ),
+                }
+            )
+            rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row["project"]),
+            str(row["station_id"]),
+            str(row["variable"]),
+            str(row["start_timestamp"]),
+        ),
+    )
+
+
+def forcing_multivariable_overlaps(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Summarize intervals with two or more candidate stuck forcing fields."""
+
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        if row["classification"] != "candidate_stuck_sensor":
+            continue
+        key = (str(row["project"]), str(row["station_file"]), str(row["station_id"]))
+        grouped.setdefault(key, []).append(row)
+    overlaps: list[dict[str, Any]] = []
+    for (project, station_file, station_id), station_rows in sorted(grouped.items()):
+        boundaries = sorted(
+            {
+                _naive_datetime(row[field], field=f"{station_file}:{field}")
+                for row in station_rows
+                for field in ("start_timestamp", "end_timestamp")
+            }
+        )
+        segments: list[tuple[datetime, datetime, tuple[str, ...]]] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            variables = tuple(
+                sorted(
+                    str(row["variable"])
+                    for row in station_rows
+                    if _naive_datetime(row["start_timestamp"], field="flatline start") <= start
+                    and _naive_datetime(row["end_timestamp"], field="flatline end") >= end
+                )
+            )
+            if len(variables) < 2 or end <= start:
+                continue
+            if segments and segments[-1][1] == start and segments[-1][2] == variables:
+                segments[-1] = (segments[-1][0], end, variables)
+            else:
+                segments.append((start, end, variables))
+        for start, end, variables in segments:
+            duration = end - start
+            overlaps.append(
+                {
+                    "project": project,
+                    "station_file": station_file,
+                    "station_id": station_id,
+                    "start_timestamp": start.isoformat(sep=" "),
+                    "end_timestamp": end.isoformat(sep=" "),
+                    "duration_hours": duration.total_seconds() / 3600.0,
+                    "variables": variables,
+                    "variable_count": len(variables),
+                    "severity": (
+                        "severe" if duration >= FORCING_FLATLINE_SEVERE_DURATION else "overlap"
+                    ),
+                }
+            )
+    return overlaps
+
+
+def forcing_flatline_summary(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    overlaps: Sequence[Mapping[str, Any]],
+    cadence_rows: Sequence[Mapping[str, Any]],
+    project_windows: Mapping[str, tuple[datetime, datetime]],
+) -> dict[str, Any]:
+    """Build deterministic aggregate forcing-QC evidence."""
+
+    projects: dict[str, Any] = {}
+    for project, (start, end) in sorted(project_windows.items()):
+        project_rows = [row for row in rows if row["project"] == project]
+        project_overlaps = [row for row in overlaps if row["project"] == project]
+        projects[project] = {
+            "start_timestamp": start.isoformat(sep=" "),
+            "end_timestamp": end.isoformat(sep=" "),
+            "run_count": len(project_rows),
+            "severe_run_count": sum(row["severity"] == "severe" for row in project_rows),
+            "candidate_stuck_sensor_count": sum(
+                row["classification"] == "candidate_stuck_sensor" for row in project_rows
+            ),
+            "dry_zero_precip_count": sum(
+                row["classification"] == "dry_zero_precip" for row in project_rows
+            ),
+            "station_count": len({str(row["station_id"]) for row in project_rows}),
+            "variable_run_counts": dict(sorted(Counter(str(row["variable"]) for row in project_rows).items())),
+            "multivariable_overlap_count": len(project_overlaps),
+            "multivariable_station_count": len(
+                {str(row["station_id"]) for row in project_overlaps}
+            ),
+            "maximum_duration_hours": max(
+                (float(row["duration_hours"]) for row in project_rows),
+                default=0.0,
+            ),
+        }
+    return {
+        "schema_version": 2,
+        "definition": "exact equal finite values over consecutive native hourly source rows",
+        "scientific_action": "warning_only_no_fill_mask_or_exclusion",
+        "audited_variables": list(MODEL_FORCING_VARIABLES),
+        "minimum_duration_hours": FORCING_FLATLINE_MINIMUM_DURATION.total_seconds() / 3600.0,
+        "severe_duration_hours": FORCING_FLATLINE_SEVERE_DURATION.total_seconds() / 3600.0,
+        "expected_source_cadence_hours": EXPECTED_FORCING_SOURCE_TIMESTEP.total_seconds() / 3600.0,
+        "forcing_files": len(cadence_rows),
+        "source_cadence_file_count": len(cadence_rows),
+        "source_gap_count": sum(int(row["gap_count"]) for row in cadence_rows),
+        "run_count": len(rows),
+        "severe_run_count": sum(row["severity"] == "severe" for row in rows),
+        "multivariable_overlap_count": len(overlaps),
+        "projects": projects,
+    }
+
+
+def _canonical_project_windows(root: Path) -> dict[str, tuple[datetime, datetime]]:
+    """Read the exact local-time window of every maintained project."""
+
+    windows: dict[str, tuple[datetime, datetime]] = {}
+    for project_name in EXPECTED_PROJECTS:
+        project_path = root / "projects" / project_name / f"{project_name}.yml"
+        project = _read_yaml(project_path)
+        start = _naive_datetime(project["start_date"], field=f"{project_name} start_date")
+        end = _naive_datetime(project["end_date"], field=f"{project_name} end_date")
+        if end <= start:
+            raise ValueError(f"Invalid forcing-QC project window: {project_name}")
+        windows[project_name] = (start, end)
+    return windows
+
+
+def _validate_eissee_2017_2018_flatline(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Require the known 2017/18 Eissee multivariable forcing limitation."""
+
+    expected_variables = {"temp", "rel_hum", "wind_speed", "wind_dir"}
+    matched = {
+        str(row["variable"])
+        for row in rows
+        if row["project"] == "project_2017_2018"
+        and row["station_file"] == "AT_LWD.Eissee.csv"
+        and row["start_timestamp"] == "2018-04-05 15:00:00"
+        and row["end_timestamp"] == "2018-09-30 21:00:00"
+        and row["severity"] == "severe"
+    }
+    if matched != expected_variables:
+        raise ValueError(
+            "Forcing-QC audit did not recover the confirmed 2017/18 Eissee "
+            f"temperature/humidity/wind plateau; matched {sorted(matched)}"
+        )
 
 
 def _duration_value(value: object) -> timedelta:
