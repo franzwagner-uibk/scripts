@@ -1,0 +1,41 @@
+schema_version: 3
+
+cadence:
+  mode: fixed_day
+  target_spacing_days: 6
+  accepted_adjacent_gap_days:
+    min: 5
+    max: 7
+  sequence: [scf, station_hs]
+  interval_start: 10-07
+  interval_end: 07-31
+  retain_skipped_slots: true
+
+fsc:
+  search_window_days: 4
+  reference_footprint: valid_cloud_nodata
+  exclude_from_reference: [water]
+  maximum_cloud_fraction: 0.20
+  maximum_invalid_fraction: 0.20
+  admission: at_least_one_subdomain
+  filter_observed_snow_fraction: false
+  holdouts: false
+
+station_hs:
+  search_window_days: 4
+  observation_time: '00:00:00'
+  model_timestep_hours: 3
+  matching: unique_nearest_or_symmetric_mean_within_half_timestep
+  symmetric_tie_max_span_hours: 24
+  shared_split_across_projects: true
+  holdouts:
+    domains_with_at_least_4_stations: 2
+    domains_with_3_stations: 1
+    domains_with_at_most_2_stations: 0
+    priority: [remaining_da_event_support, elevation_spread, station_id]
+    preserve_da_support: true
+    allow_recorded_reduction: true
+
+fulfillment:
+  denominator: feasible_slots
+  minimum_fraction_per_type: 0.85

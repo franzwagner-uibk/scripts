@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -22,6 +23,7 @@ from da_event_scheduler import (
     ScheduleResult,
     StationRoleResult,
     load_policy,
+    log_selected_station_interpolations,
     match_station_support,
     parse_date,
     read_csv_records,
@@ -272,6 +274,27 @@ def _build_canonical_schedules(
     )
 
 
+def _log_selected_interpolations_for_root(
+    root: Path,
+    schedules: Mapping[str, ScheduleResult],
+    policy_path: Path,
+) -> int:
+    """Log selected midpoint interpolations without changing audit schemas."""
+
+    policy = load_policy(policy_path)
+    if detect_setup_layout(root) == CANONICAL_LAYOUT:
+        station_rows = _canonical_station_rows_with_subdomains(
+            root,
+            read_csv_records(root / "obs" / "stations" / "stations_da_metadata.csv"),
+        )
+        snow_rows = _canonical_snow_inventory(root, station_rows)
+    else:
+        snow_rows = read_csv_records(
+            root / "inventories" / "snow_station_timestep_support.csv"
+        )
+    return log_selected_station_interpolations(schedules, snow_rows, policy)
+
+
 def _canonical_setup_yaml(root: Path) -> Path:
     paths = sorted(Path(root).glob("*.yml"))
     if len(paths) != 1:
@@ -513,6 +536,7 @@ def preflight(root: Path, policy_path: Path, image: str, *, verify_hashes: bool 
         source = validate_canonical_setup(root, image)
         hash_counts = {}
     roles, schedules = build_schedules(root, policy_path)
+    _log_selected_interpolations_for_root(root, schedules, policy_path)
     return {
         "status": "PREFLIGHT_OK",
         "layout": layout,
@@ -683,6 +707,7 @@ def _refresh_canonical_setup(
     runtime_artifact_paths = [path.relative_to(root).as_posix() for path in runtime_artifacts]
     source = validate_canonical_setup(root, image)
     roles, schedules = build_schedules(root, policy_path)
+    _log_selected_interpolations_for_root(root, schedules, policy_path)
     commit = _finalizer_commit()
     parent_configs = {
         _canonical_setup_yaml(root).relative_to(root).as_posix(): sha256_file(_canonical_setup_yaml(root)),
@@ -1094,6 +1119,11 @@ def _write_canonical_audits(
     )
     _write_forcing_flatline_inventory(staging)
     _write_station_fsc_audit(staging, schedules, load_policy(policy_path))
+    _write_fsc_areal_strata_audit(
+        staging,
+        schedules,
+        elevation_band_width_m=250,
+    )
 
 
 def _write_canonical_refresh_manifest(
@@ -1387,7 +1417,7 @@ def _write_station_fsc_audit(
         {
             "selected_fsc_events": len(selected),
             "station_scene_comparisons": len(comparison_rows),
-            "station_time_matching": "unique nearest within half one model timestep",
+            "station_time_matching": policy.station_matching,
             "spatial_support": ["native FSC pixel containing nearest center", "bounded native 3x3 FSC neighborhood"],
             "interpretation": (
                 "Semi-independent consistency evidence only. Point snow depth is local and must not be "
@@ -2451,6 +2481,7 @@ def _write_incomplete(root: Path, error: str) -> None:
 def main() -> int:
     """Run read-only preflight or rollback-safe finalization."""
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
     if args.preflight:
         print(json.dumps(preflight(args.setup_root, args.policy, args.image), indent=2, sort_keys=True))

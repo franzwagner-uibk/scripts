@@ -5,13 +5,18 @@ from __future__ import annotations
 import csv
 import itertools
 import json
+import logging
 import math
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,8 @@ class SchedulePolicy:
     minimum_fulfillment: float
     station_observation_time: time
     model_timestep_hours: int
+    station_matching: str
+    symmetric_tie_max_span_hours: int | None
     fulfillment_denominator: str
 
 
@@ -98,6 +105,9 @@ class StationMatch:
     observation_timestamp: datetime
     delta_minutes: float
     observation_value: float | None
+    source_timestamps: tuple[datetime, ...] = ()
+    source_values: tuple[float, ...] = ()
+    interpolated: bool = False
 
 
 def parse_date(value: object, *, field: str) -> date:
@@ -140,10 +150,16 @@ def load_policy(path: Path) -> SchedulePolicy:
         minimum_fulfillment=float(fulfillment.get("minimum_fraction_per_type", -1.0)),
         station_observation_time=observation_time,
         model_timestep_hours=int(station.get("model_timestep_hours", 0)),
+        station_matching=str(station.get("matching", "")).strip(),
+        symmetric_tie_max_span_hours=(
+            int(station["symmetric_tie_max_span_hours"])
+            if station.get("symmetric_tie_max_span_hours") is not None
+            else None
+        ),
         fulfillment_denominator=str(fulfillment.get("denominator", "")).strip(),
     )
-    if policy.schema_version != 2:
-        raise ValueError("Only scheduler policy schema_version 2 is supported")
+    if policy.schema_version not in {2, 3}:
+        raise ValueError("Only scheduler policy schema_version 2 or 3 is supported")
     if policy.target_spacing_days < 1 or policy.sequence != ("scf", "station_hs"):
         raise ValueError("Policy must use positive fixed-day spacing and sequence [scf, station_hs]")
     if policy.minimum_gap_days < 1 or policy.maximum_gap_days < policy.minimum_gap_days:
@@ -171,11 +187,6 @@ def load_policy(path: Path) -> SchedulePolicy:
         (fsc.get("filter_observed_snow_fraction"), False, "fsc.filter_observed_snow_fraction"),
         (fsc.get("holdouts"), False, "fsc.holdouts"),
         (
-            station.get("matching"),
-            "unique_nearest_within_half_timestep",
-            "station_hs.matching",
-        ),
-        (
             station.get("shared_split_across_projects"),
             True,
             "station_hs.shared_split_across_projects",
@@ -184,6 +195,20 @@ def load_policy(path: Path) -> SchedulePolicy:
     for actual, expected, field in fixed_contract:
         if actual != expected:
             raise ValueError(f"{field} must be {expected!r}")
+    expected_matching = (
+        "unique_nearest_within_half_timestep"
+        if policy.schema_version == 2
+        else "unique_nearest_or_symmetric_mean_within_half_timestep"
+    )
+    if policy.station_matching != expected_matching:
+        raise ValueError(f"station_hs.matching must be {expected_matching!r}")
+    if policy.schema_version == 2:
+        if policy.symmetric_tie_max_span_hours is not None:
+            raise ValueError(
+                "station_hs.symmetric_tie_max_span_hours is supported only by schema_version 3"
+            )
+    elif policy.symmetric_tie_max_span_hours != 24:
+        raise ValueError("station_hs.symmetric_tie_max_span_hours must be 24")
     holdouts = station.get("holdouts") or {}
     expected_holdouts = {
         "domains_with_at_least_4_stations": 2,
@@ -1085,11 +1110,12 @@ def match_station_support(
     snow_rows: Sequence[Mapping[str, Any]],
     policy: SchedulePolicy,
 ) -> dict[datetime, dict[str, StationMatch]]:
-    """Match observations to daily DA timesteps within half one model timestep."""
+    """Match observations to daily DA timesteps under the versioned policy."""
 
     tolerance = timedelta(hours=policy.model_timestep_hours / 2)
-    matches: dict[datetime, dict[str, StationMatch]] = defaultdict(dict)
+    observations: dict[str, list[StationMatch]] = defaultdict(list)
     domains: dict[str, str] = {}
+    seen_timestamps: set[tuple[str, datetime]] = set()
     for row in snow_rows:
         if not _row_has_observation(row):
             continue
@@ -1101,36 +1127,179 @@ def match_station_support(
         if previous_domain != subdomain_id:
             raise ValueError(f"Station {station_id} maps to multiple subdomains")
         observation = _observation_timestamp(row)
-        day_targets = tuple(
-            datetime.combine(observation.date() + timedelta(days=offset), policy.station_observation_time)
-            for offset in (-1, 0, 1)
-        )
-        deltas = tuple(abs(observation - target) for target in day_targets)
-        minimum = min(deltas)
-        if minimum > tolerance:
-            continue
-        nearest = tuple(target for target, delta in zip(day_targets, deltas) if delta == minimum)
-        if len(nearest) != 1:
+        timestamp_key = (station_id, observation)
+        if timestamp_key in seen_timestamps:
             raise ValueError(
-                f"Ambiguous half-timestep match for station {station_id} at {observation.isoformat(sep=' ')}"
+                f"Duplicate station observation timestamp for {station_id}: "
+                f"{observation.isoformat(sep=' ')}"
             )
-        model_time = nearest[0]
+        seen_timestamps.add(timestamp_key)
+        observation_value = _optional_observation_value(row)
         match = StationMatch(
             station_id=station_id,
             subdomain_id=subdomain_id,
             observation_timestamp=observation,
-            delta_minutes=minimum.total_seconds() / 60.0,
-            observation_value=_optional_observation_value(row),
+            delta_minutes=0.0,
+            observation_value=observation_value,
+            source_timestamps=(observation,),
+            source_values=tuple(
+                value
+                for value in (observation_value,)
+                if value is not None
+            ),
         )
-        existing = matches[model_time].get(station_id)
-        if existing is None or match.delta_minutes < existing.delta_minutes:
-            matches[model_time][station_id] = match
-        elif match.delta_minutes == existing.delta_minutes:
-            raise ValueError(
-                f"Ambiguous station observations for {station_id} at model timestep "
-                f"{model_time.isoformat(sep=' ')}"
+        observations[station_id].append(match)
+
+    matches: dict[datetime, dict[str, StationMatch]] = {}
+    for station_id, station_observations in sorted(observations.items()):
+        ordered = sorted(station_observations, key=lambda match: match.observation_timestamp)
+        timestamps = [match.observation_timestamp for match in ordered]
+        first_day = timestamps[0].date() - timedelta(days=1)
+        last_day = timestamps[-1].date() + timedelta(days=1)
+        target_day = first_day
+        while target_day <= last_day:
+            model_time = datetime.combine(target_day, policy.station_observation_time)
+            insertion = bisect_left(timestamps, model_time)
+            neighbor_indices = tuple(
+                index
+                for index in (insertion - 1, insertion)
+                if 0 <= index < len(ordered)
             )
-    return {model_time: dict(sorted(station_matches.items())) for model_time, station_matches in sorted(matches.items())}
+            raw_matches = [ordered[index] for index in neighbor_indices]
+            minimum_delta = min(
+                (abs(match.observation_timestamp - model_time) for match in raw_matches),
+                default=tolerance + timedelta.resolution,
+            )
+            if minimum_delta > tolerance:
+                target_day += timedelta(days=1)
+                continue
+            nearest = sorted(
+                (
+                    match
+                    for match in raw_matches
+                    if abs(match.observation_timestamp - model_time) == minimum_delta
+                ),
+                key=lambda match: match.observation_timestamp,
+            )
+            if len(nearest) == 1:
+                source = nearest[0]
+                resolved = StationMatch(
+                    station_id=source.station_id,
+                    subdomain_id=source.subdomain_id,
+                    observation_timestamp=source.observation_timestamp,
+                    delta_minutes=minimum_delta.total_seconds() / 60.0,
+                    observation_value=source.observation_value,
+                    source_timestamps=source.source_timestamps,
+                    source_values=source.source_values,
+                )
+            else:
+                if policy.schema_version == 2:
+                    raise ValueError(
+                        f"Ambiguous station observations for {station_id} at model timestep "
+                        f"{model_time.isoformat(sep=' ')}"
+                    )
+                resolved = _interpolate_symmetric_station_tie(
+                    station_id=station_id,
+                    model_time=model_time,
+                    matches=nearest,
+                    policy=policy,
+                )
+            matches.setdefault(model_time, {})[station_id] = resolved
+            target_day += timedelta(days=1)
+    return {
+        model_time: dict(sorted(station_matches.items()))
+        for model_time, station_matches in sorted(matches.items())
+    }
+
+
+def _interpolate_symmetric_station_tie(
+    *,
+    station_id: str,
+    model_time: datetime,
+    matches: Sequence[StationMatch],
+    policy: SchedulePolicy,
+) -> StationMatch:
+    """Resolve exactly one symmetric two-value tie under policy v3."""
+
+    if len(matches) != 2:
+        raise ValueError(
+            f"Station {station_id} has {len(matches)} equally near observations at model "
+            f"timestep {model_time.isoformat(sep=' ')}; exactly two are required"
+        )
+    before, after = matches
+    if not before.observation_timestamp < model_time < after.observation_timestamp:
+        raise ValueError(
+            f"Station {station_id} equal-nearest observations do not bracket model "
+            f"timestep {model_time.isoformat(sep=' ')}"
+        )
+    before_offset = model_time - before.observation_timestamp
+    after_offset = after.observation_timestamp - model_time
+    if before_offset != after_offset:
+        raise ValueError(
+            f"Station {station_id} observations are not symmetric around model timestep "
+            f"{model_time.isoformat(sep=' ')}"
+        )
+    tolerance = timedelta(hours=policy.model_timestep_hours / 2)
+    if before_offset > tolerance:
+        raise ValueError(
+            f"Station {station_id} symmetric observations exceed the half-timestep window"
+        )
+    maximum_span = timedelta(hours=policy.symmetric_tie_max_span_hours or 0)
+    if after.observation_timestamp - before.observation_timestamp > maximum_span:
+        raise ValueError(
+            f"Station {station_id} symmetric observation span exceeds "
+            f"{policy.symmetric_tie_max_span_hours} hours"
+        )
+    if before.observation_value is None or after.observation_value is None:
+        raise ValueError(
+            f"Station {station_id} symmetric interpolation requires both scalar values"
+        )
+    mean_value = (before.observation_value + after.observation_value) / 2.0
+    return StationMatch(
+        station_id=station_id,
+        subdomain_id=before.subdomain_id,
+        observation_timestamp=model_time,
+        delta_minutes=before_offset.total_seconds() / 60.0,
+        observation_value=mean_value,
+        source_timestamps=(before.observation_timestamp, after.observation_timestamp),
+        source_values=(before.observation_value, after.observation_value),
+        interpolated=True,
+    )
+
+
+def log_selected_station_interpolations(
+    schedules: Mapping[str, ScheduleResult],
+    snow_rows: Sequence[Mapping[str, Any]],
+    policy: SchedulePolicy,
+) -> int:
+    """Log each interpolation retained by a final schedule exactly once."""
+
+    support = match_station_support(snow_rows, policy)
+    count = 0
+    for schedule_name, result in sorted(schedules.items()):
+        selected_times = sorted(
+            datetime.fromisoformat(str(event["selected_timestamp"]))
+            for event in result.events
+            if event["variable"] == "station_hs"
+        )
+        for model_time in selected_times:
+            for station_id, match in sorted(support.get(model_time, {}).items()):
+                if not match.interpolated:
+                    continue
+                LOGGER.info(
+                    "Selected symmetric station interpolation: schedule=%s station=%s "
+                    "target=%s source_times=(%s, %s) source_values=(%.12g, %.12g) mean=%.12g",
+                    schedule_name,
+                    station_id,
+                    model_time.isoformat(sep=" "),
+                    match.source_timestamps[0].isoformat(sep=" "),
+                    match.source_timestamps[1].isoformat(sep=" "),
+                    match.source_values[0],
+                    match.source_values[1],
+                    match.observation_value,
+                )
+                count += 1
+    return count
 
 
 def _quality_records(

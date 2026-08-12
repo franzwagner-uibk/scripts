@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import logging
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -27,6 +28,8 @@ from da_event_scheduler import (  # noqa: E402
     fsc_reference_metrics,
     generate_slots,
     load_policy,
+    log_selected_station_interpolations,
+    match_station_support,
     schedule_events,
     schedule_with_adaptive_roles,
     write_schedule_outputs,
@@ -49,9 +52,21 @@ def _policy(**changes: object) -> SchedulePolicy:
         minimum_fulfillment=0.85,
         station_observation_time=time(0),
         model_timestep_hours=3,
+        station_matching="unique_nearest_within_half_timestep",
+        symmetric_tie_max_span_hours=None,
         fulfillment_denominator="feasible_slots",
     )
     return replace(base, **changes)
+
+
+def _policy_v3(**changes: object) -> SchedulePolicy:
+    return replace(
+        _policy(),
+        schema_version=3,
+        station_matching="unique_nearest_or_symmetric_mean_within_half_timestep",
+        symmetric_tie_max_span_hours=24,
+        **changes,
+    )
 
 
 def _fsc(day: str, *, cloud: int = 10, invalid: int = 10, water: int = 20) -> list[dict[str, object]]:
@@ -170,6 +185,13 @@ def test_versioned_policy_loads_the_fixed_v2_contract() -> None:
     assert policy.maximum_cloud_fraction == 0.20
     assert policy.maximum_invalid_fraction == 0.20
     assert policy.fulfillment_denominator == "feasible_slots"
+
+
+def test_versioned_policy_v3_adds_fixed_symmetric_tie_contract() -> None:
+    policy = load_policy(MODULE_ROOT / "policies" / "north_tyrol_alternating_6day_v3.yml")
+    assert policy.schema_version == 3
+    assert policy.station_matching == "unique_nearest_or_symmetric_mean_within_half_timestep"
+    assert policy.symmetric_tie_max_span_hours == 24
 
 
 def test_slots_quality_gates_and_exact_timestep_selection() -> None:
@@ -474,6 +496,147 @@ def test_station_half_timestep_tie_is_rejected() -> None:
             start=date(2022, 10, 1),
             end=date(2022, 10, 31),
         )
+
+
+def test_policy_v3_interpolates_one_symmetric_tie_and_keeps_source_offset() -> None:
+    rows = [
+        {**_snow("2022-10-12 23:00:00", "a", "A"), "observation_value": 0.4},
+        {**_snow("2022-10-13 01:00:00", "a", "A"), "observation_value": 0.8},
+    ]
+    matches = match_station_support(rows, _policy_v3())
+    match = matches[datetime(2022, 10, 13)]["a"]
+
+    assert match.observation_timestamp == datetime(2022, 10, 13)
+    assert match.observation_value == pytest.approx(0.6)
+    assert match.delta_minutes == 60.0
+    assert match.interpolated is True
+    assert match.source_timestamps == (
+        datetime(2022, 10, 12, 23),
+        datetime(2022, 10, 13, 1),
+    )
+
+    result = schedule_events(
+        policy=replace(
+            _policy_v3(),
+            interval_start=(10, 13),
+            interval_end=(10, 13),
+            sequence=("station_hs", "scf"),
+        ),
+        fsc_rows=[],
+        snow_rows=rows,
+        station_roles=_roles(),
+        start=date(2022, 10, 1),
+        end=date(2022, 10, 31),
+    )
+    assert result.events[0]["station_match_max_delta_minutes"] == 60.0
+
+
+def test_policy_v3_accepts_the_inclusive_24_hour_pair_span() -> None:
+    policy = _policy_v3(
+        station_observation_time=time(0),
+        model_timestep_hours=24,
+    )
+    matches = match_station_support(
+        [
+            {**_snow("2022-10-12 12:00:00", "a", "A"), "observation_value": 0.2},
+            {**_snow("2022-10-13 12:00:00", "a", "A"), "observation_value": 1.0},
+        ],
+        policy,
+    )
+    match = matches[datetime(2022, 10, 13)]["a"]
+    assert match.observation_value == pytest.approx(0.6)
+    assert match.delta_minutes == 12 * 60
+
+
+def test_policy_v3_rejects_duplicate_timestamps() -> None:
+    rows = [
+        {**_snow("2022-10-12 23:00:00", "a", "A"), "observation_value": 0.2},
+        {**_snow("2022-10-12 23:00:00", "a", "A"), "observation_value": 1.0},
+    ]
+    with pytest.raises(ValueError, match="Duplicate station observation timestamp"):
+        match_station_support(rows, _policy_v3())
+
+
+def test_policy_v3_does_not_match_a_pair_wider_than_24_hours() -> None:
+    rows = [
+        {**_snow("2022-10-12 11:00:00", "a", "A"), "observation_value": 0.2},
+        {**_snow("2022-10-13 13:00:00", "a", "A"), "observation_value": 1.0},
+    ]
+    matches = match_station_support(rows, _policy_v3(model_timestep_hours=24))
+    assert datetime(2022, 10, 13) not in matches
+
+
+def test_policy_v3_prefers_exact_support_over_an_interpolated_candidate() -> None:
+    policy = replace(
+        _policy_v3(),
+        interval_start=(10, 13),
+        interval_end=(10, 13),
+        sequence=("station_hs", "scf"),
+    )
+    rows = [
+        {**_snow("2022-10-12 23:00:00", "a", "A"), "observation_value": 0.4},
+        {**_snow("2022-10-13 01:00:00", "a", "A"), "observation_value": 0.8},
+        {**_snow("2022-10-14 00:00:00", "a", "A"), "observation_value": 0.9},
+    ]
+    result = schedule_events(
+        policy=policy,
+        fsc_rows=[],
+        snow_rows=rows,
+        station_roles=_roles(),
+        start=date(2022, 10, 1),
+        end=date(2022, 10, 31),
+    )
+    assert result.events[0]["selected_date"] == "2022-10-14"
+    assert result.events[0]["station_match_max_delta_minutes"] == 0.0
+
+
+def test_policy_v3_interpolation_counts_as_role_support() -> None:
+    rows = [
+        {**_snow("2022-10-12 23:00:00", "a", "A"), "observation_value": 0.4},
+        {**_snow("2022-10-13 01:00:00", "a", "A"), "observation_value": 0.8},
+    ]
+    roles = assign_station_roles(
+        rows,
+        [{"station_id": "a", "subdomain_id": "A", "alt": 1500}],
+        _policy_v3(),
+        support_times=(datetime(2022, 10, 13),),
+    )
+    assert roles.roles[0]["role"] == "da"
+    assert roles.roles[0]["valid_timestep_count"] == 1
+
+
+def test_selected_interpolation_logging_excludes_unselected_candidates(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    policy = replace(
+        _policy_v3(),
+        interval_start=(10, 13),
+        interval_end=(10, 13),
+        sequence=("station_hs", "scf"),
+    )
+    rows = [
+        {**_snow("2022-10-12 23:00:00", "a", "A"), "observation_value": 0.4},
+        {**_snow("2022-10-13 01:00:00", "a", "A"), "observation_value": 0.8},
+        {**_snow("2022-10-13 23:00:00", "a", "A"), "observation_value": 1.0},
+        {**_snow("2022-10-14 01:00:00", "a", "A"), "observation_value": 1.2},
+    ]
+    result = schedule_events(
+        policy=policy,
+        fsc_rows=[],
+        snow_rows=rows,
+        station_roles=_roles(),
+        start=date(2022, 10, 1),
+        end=date(2022, 10, 31),
+    )
+    caplog.set_level(logging.INFO, logger="da_event_scheduler")
+
+    count = log_selected_station_interpolations({"schedule": result}, rows, policy)
+
+    assert count == 1
+    assert "target=2022-10-13 00:00:00" in caplog.text
+    assert "source_times=(2022-10-12 23:00:00, 2022-10-13 01:00:00)" in caplog.text
+    assert "source_values=(0.4, 0.8) mean=0.6" in caplog.text
+    assert "2022-10-14 00:00:00" not in caplog.text
 
 
 def test_fulfillment_uses_feasible_slots_and_dates_are_globally_unique() -> None:
@@ -932,6 +1095,48 @@ def test_fsc_areal_strata_keep_point_and_areal_support_separate() -> None:
     assert landcover[0]["fsc_mean_percent"] == 25.0
 
 
+def test_canonical_audits_use_the_approved_250_m_elevation_bands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(finalizer, "EXPECTED_PROJECTS", ())
+    monkeypatch.setattr(finalizer, "_canonical_subdomain_ids", lambda _root: ())
+    monkeypatch.setattr(finalizer, "_write_forcing_flatline_inventory", lambda _root: None)
+    monkeypatch.setattr(
+        finalizer,
+        "_write_station_fsc_audit",
+        lambda _root, _schedules, _policy: None,
+    )
+
+    def capture_areal(
+        root: Path,
+        schedules: dict[str, ScheduleResult],
+        *,
+        elevation_band_width_m: int,
+    ) -> None:
+        captured.update(
+            root=root,
+            schedules=schedules,
+            elevation_band_width_m=elevation_band_width_m,
+        )
+
+    monkeypatch.setattr(finalizer, "_write_fsc_areal_strata_audit", capture_areal)
+    finalizer._write_canonical_audits(
+        tmp_path,
+        {},
+        StationRoleResult((), ()),
+        MODULE_ROOT / "policies" / "north_tyrol_alternating_6day_v3.yml",
+        "registry.example/openamundsen-da@sha256:" + "a" * 64,
+    )
+
+    assert captured == {
+        "root": tmp_path,
+        "schedules": {},
+        "elevation_band_width_m": 250,
+    }
+
+
 def test_container_rooted_symlinks_become_internal_relative_links(tmp_path: Path) -> None:
     root = tmp_path / "staging"
     target = root / "meteo" / "station.csv"
@@ -1132,6 +1337,7 @@ def test_failed_canonical_refresh_keeps_source_and_marks_staging_incomplete(
     monkeypatch.setattr(finalizer, "_assert_canonical_runtime_safe", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(finalizer, "validate_canonical_setup", lambda *_args: {"root": str(root)})
     monkeypatch.setattr(finalizer, "build_schedules", lambda *_args: (roles, {}))
+    monkeypatch.setattr(finalizer, "_log_selected_interpolations_for_root", lambda *_args: 0)
     monkeypatch.setattr(finalizer, "_finalizer_commit", lambda: "a" * 40)
     for function_name in (
         "_write_canonical_station_roles",
@@ -1173,6 +1379,7 @@ def test_post_swap_validation_failure_restores_canonical_source(
     monkeypatch.setattr(finalizer, "_assert_canonical_runtime_safe", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(finalizer, "validate_canonical_setup", lambda *_args: {"root": str(root)})
     monkeypatch.setattr(finalizer, "build_schedules", lambda *_args: (roles, schedules))
+    monkeypatch.setattr(finalizer, "_log_selected_interpolations_for_root", lambda *_args: 0)
     monkeypatch.setattr(finalizer, "_finalizer_commit", lambda: "a" * 40)
     for function_name in (
         "_write_canonical_station_roles",
