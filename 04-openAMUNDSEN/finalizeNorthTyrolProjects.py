@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -258,7 +259,10 @@ def _build_canonical_schedules(
                 parse_date(project["end_date"], field=f"{project_name} end"),
             )
         )
-    station_rows = read_csv_records(root / "obs" / "stations" / "stations_da_metadata.csv")
+    station_rows = _canonical_station_rows_with_subdomains(
+        root,
+        read_csv_records(root / "obs" / "stations" / "stations_da_metadata.csv"),
+    )
     return schedule_with_adaptive_roles(
         policy=policy,
         fsc_rows=_canonical_fsc_inventory(root),
@@ -275,6 +279,80 @@ def _canonical_setup_yaml(root: Path) -> Path:
     return paths[0]
 
 
+def _canonical_station_rows_with_subdomains(
+    root: Path,
+    station_rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Return canonical station rows with strict polygon-derived membership."""
+
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    regions_path = Path(root) / "env" / "subdomains.gpkg"
+    if not regions_path.is_file():
+        raise FileNotFoundError(regions_path)
+    regions = gpd.read_file(regions_path)
+    if "id" not in regions.columns:
+        raise ValueError(f"Canonical subdomains lack required 'id' field: {regions_path}")
+    if regions.crs is None or regions.crs.to_epsg() != 25832:
+        raise ValueError(f"Canonical subdomains must use EPSG:25832, got {regions.crs}")
+
+    identifiers = [str(value).strip() for value in regions["id"]]
+    if any(not value for value in identifiers):
+        raise ValueError("Canonical subdomain IDs must be non-empty")
+    duplicate_ids = sorted(
+        identifier
+        for identifier, count in Counter(identifiers).items()
+        if count > 1
+    )
+    if duplicate_ids:
+        raise ValueError(f"Canonical subdomain IDs must be unique: {duplicate_ids}")
+    invalid_geometries = sorted(
+        identifiers[index]
+        for index, geometry in enumerate(regions.geometry)
+        if geometry is None or geometry.is_empty or not geometry.is_valid
+    )
+    if invalid_geometries:
+        raise ValueError(
+            "Canonical subdomain geometries must be non-empty and valid: "
+            f"{invalid_geometries}"
+        )
+    ordered_regions = sorted(
+        zip(identifiers, regions.geometry, strict=True),
+        key=lambda item: item[0],
+    )
+
+    normalized: list[dict[str, Any]] = []
+    for station in station_rows:
+        station_id = str(station.get("station_id", station.get("id", ""))).strip()
+        if not station_id:
+            raise ValueError("Canonical station metadata contains an empty station ID")
+        try:
+            x = float(station["x"])
+            y = float(station["y"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Canonical station has invalid EPSG:25832 coordinates: {station_id}"
+            ) from exc
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError(
+                f"Canonical station has invalid EPSG:25832 coordinates: {station_id}"
+            )
+        point = Point(x, y)
+        matches = [
+            subdomain_id
+            for subdomain_id, geometry in ordered_regions
+            if geometry.covers(point)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Canonical station must be covered by exactly one subdomain: "
+                f"station_id={station_id!r}, matches={matches}"
+            )
+        normalized.append({**station, "subdomain_id": matches[0]})
+    return tuple(normalized)
+
+
 def _canonical_snow_inventory(
     root: Path,
     station_rows: Sequence[Mapping[str, Any]],
@@ -286,7 +364,7 @@ def _canonical_snow_inventory(
         station_id = str(station["station_id"]).strip()
         subdomain_id = str(station.get("subdomain_id", "")).strip()
         if not subdomain_id:
-            raise ValueError(f"Station metadata lacks subdomain_id: {station_id}")
+            raise ValueError(f"Normalized station metadata lacks subdomain_id: {station_id}")
         series_path = root / "obs" / "stations" / f"{station_id}.csv"
         if not series_path.is_file():
             raise FileNotFoundError(series_path)
@@ -1200,7 +1278,10 @@ def _write_station_fsc_audit(
 
     from north_tyrol_snapshot import classify_fsc
 
-    station_rows = read_csv_records(root / "obs" / "stations" / "stations_da_metadata.csv")
+    station_rows = _canonical_station_rows_with_subdomains(
+        root,
+        read_csv_records(root / "obs" / "stations" / "stations_da_metadata.csv"),
+    )
     metadata = {str(row["station_id"]).strip(): row for row in station_rows}
     snow_rows = _canonical_snow_inventory(root, station_rows)
     station_support = match_station_support(snow_rows, policy)

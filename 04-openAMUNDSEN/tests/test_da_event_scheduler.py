@@ -643,6 +643,183 @@ def test_image_requires_immutable_digest() -> None:
         finalizer.validate_image_reference("registry.example/oa:latest")
 
 
+def _write_test_subdomains(
+    root: Path,
+    identifiers: list[str],
+    geometries: list[object],
+    *,
+    crs: str = "EPSG:25832",
+) -> None:
+    import geopandas as gpd
+
+    env = root / "env"
+    env.mkdir(parents=True, exist_ok=True)
+    gpd.GeoDataFrame(
+        {"id": identifiers},
+        geometry=geometries,
+        crs=crs,
+    ).to_file(env / "subdomains.gpkg", driver="GPKG")
+
+
+def test_canonical_station_membership_is_derived_without_mutating_metadata(
+    tmp_path: Path,
+) -> None:
+    from shapely.geometry import box
+
+    _write_test_subdomains(
+        tmp_path,
+        ["B", "A"],
+        [box(20, 0, 30, 10), box(0, 0, 10, 10)],
+    )
+    metadata_path = tmp_path / "obs" / "stations" / "stations_da_metadata.csv"
+    metadata_path.parent.mkdir(parents=True)
+    original = (
+        "station_id,x,y,use_for_da,use_for_benchmark\n"
+        "inside_b,25,5,True,False\n"
+        "boundary_a,0,5,False,True\n"
+    )
+    metadata_path.write_text(original, encoding="utf-8")
+
+    rows = finalizer._canonical_station_rows_with_subdomains(
+        tmp_path,
+        finalizer.read_csv_records(metadata_path),
+    )
+
+    assert [(row["station_id"], row["subdomain_id"]) for row in rows] == [
+        ("inside_b", "B"),
+        ("boundary_a", "A"),
+    ]
+    assert metadata_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("identifiers", "geometries", "station", "message"),
+    [
+        (["A"], [(0, 0, 10, 10)], {"station_id": "outside", "x": 20, "y": 20}, "matches=\\[\\]"),
+        (
+            ["A", "B"],
+            [(0, 0, 10, 10), (5, 0, 15, 10)],
+            {"station_id": "overlap", "x": 7, "y": 5},
+            "matches=\\['A', 'B'\\]",
+        ),
+    ],
+)
+def test_canonical_station_membership_rejects_non_unique_coverage(
+    tmp_path: Path,
+    identifiers: list[str],
+    geometries: list[tuple[int, int, int, int]],
+    station: dict[str, object],
+    message: str,
+) -> None:
+    from shapely.geometry import box
+
+    _write_test_subdomains(
+        tmp_path,
+        identifiers,
+        [box(*bounds) for bounds in geometries],
+    )
+
+    with pytest.raises(ValueError, match=message):
+        finalizer._canonical_station_rows_with_subdomains(tmp_path, [station])
+
+
+def test_canonical_station_membership_rejects_invalid_spatial_contracts(
+    tmp_path: Path,
+) -> None:
+    from shapely.geometry import Polygon, box
+
+    wrong_crs = tmp_path / "wrong_crs"
+    _write_test_subdomains(wrong_crs, ["A"], [box(0, 0, 1, 1)], crs="EPSG:4326")
+    with pytest.raises(ValueError, match="EPSG:25832"):
+        finalizer._canonical_station_rows_with_subdomains(
+            wrong_crs,
+            [{"station_id": "a", "x": 0.5, "y": 0.5}],
+        )
+
+    duplicate = tmp_path / "duplicate"
+    _write_test_subdomains(
+        duplicate,
+        ["A", "A"],
+        [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+    )
+    with pytest.raises(ValueError, match="IDs must be unique"):
+        finalizer._canonical_station_rows_with_subdomains(
+            duplicate,
+            [{"station_id": "a", "x": 0.5, "y": 0.5}],
+        )
+
+    invalid_geometry = tmp_path / "invalid_geometry"
+    _write_test_subdomains(
+        invalid_geometry,
+        ["A"],
+        [Polygon([(0, 0), (1, 1), (1, 0), (0, 1), (0, 0)])],
+    )
+    with pytest.raises(ValueError, match="geometries must be non-empty and valid"):
+        finalizer._canonical_station_rows_with_subdomains(
+            invalid_geometry,
+            [{"station_id": "a", "x": 0.5, "y": 0.5}],
+        )
+
+    valid = tmp_path / "valid"
+    _write_test_subdomains(valid, ["A"], [box(0, 0, 1, 1)])
+    with pytest.raises(ValueError, match="invalid EPSG:25832 coordinates"):
+        finalizer._canonical_station_rows_with_subdomains(
+            valid,
+            [{"station_id": "a", "x": "nan", "y": 0.5}],
+        )
+
+
+def test_canonical_schedule_normalizes_station_membership_in_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from shapely.geometry import box
+
+    project_name = "project_2017_2018"
+    project = tmp_path / "projects" / project_name
+    project.mkdir(parents=True)
+    (tmp_path / "north.yml").write_text(
+        "start_date: '2017-10-01 00:00:00'\n",
+        encoding="utf-8",
+    )
+    (project / f"{project_name}.yml").write_text(
+        "start_date: '2017-10-01'\nend_date: '2018-09-30'\n",
+        encoding="utf-8",
+    )
+    _write_test_subdomains(tmp_path, ["A"], [box(0, 0, 10, 10)])
+    station_dir = tmp_path / "obs" / "stations"
+    station_dir.mkdir(parents=True)
+    metadata_path = station_dir / "stations_da_metadata.csv"
+    original = "station_id,x,y,alt\n001,5,5,1500\n"
+    metadata_path.write_text(original, encoding="utf-8")
+    (station_dir / "001.csv").write_text(
+        "time,snow_depth\n2017-10-13 00:00:00,0.5\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def capture_schedule(**kwargs: object) -> tuple[StationRoleResult, dict[str, ScheduleResult]]:
+        captured.update(kwargs)
+        return StationRoleResult((), ()), {}
+
+    monkeypatch.setattr(finalizer, "EXPECTED_PROJECTS", (project_name,))
+    monkeypatch.setattr(finalizer, "_canonical_fsc_inventory", lambda _root: [])
+    monkeypatch.setattr(finalizer, "schedule_with_adaptive_roles", capture_schedule)
+
+    finalizer._build_canonical_schedules(
+        tmp_path,
+        MODULE_ROOT / "policies" / "north_tyrol_alternating_6day_v2.yml",
+    )
+
+    station_rows = captured["station_rows"]
+    snow_rows = captured["snow_rows"]
+    assert isinstance(station_rows, tuple)
+    assert station_rows[0]["subdomain_id"] == "A"
+    assert isinstance(snow_rows, list)
+    assert snow_rows[0]["subdomain_id"] == "A"
+    assert metadata_path.read_text(encoding="utf-8") == original
+
+
 def test_legacy_fsc_inventory_requires_stable_reference_schema(tmp_path: Path) -> None:
     inventory = tmp_path / "inventories"
     inventory.mkdir()

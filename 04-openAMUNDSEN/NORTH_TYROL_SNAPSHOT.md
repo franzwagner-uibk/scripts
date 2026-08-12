@@ -86,6 +86,13 @@ filter, regenerates all 48 leaves and validates their steps without propagation.
 It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
 
+The canonical station table remains documentation-shaped and does not require a
+scheduler-only `subdomain_id` column. The adapter derives membership in memory
+from each station's EPSG:25832 `x`/`y` coordinates and the accepted
+`env/subdomains.gpkg`. Every station must be covered by exactly one valid,
+uniquely identified subdomain polygon; missing or ambiguous membership fails
+without rewriting station metadata.
+
 Canonical refresh refuses runtime locks, live model processes and containers
 mounted on the setup. Host checks inspect both process arguments and
 `/proc/<pid>/cwd`, including relative-path commands started inside the setup.
