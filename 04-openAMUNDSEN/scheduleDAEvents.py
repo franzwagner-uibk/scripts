@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from da_event_scheduler import (
     load_policy,
+    log_selected_station_interpolations,
     parse_date,
     read_csv_records,
     schedule_with_adaptive_roles,
@@ -34,16 +36,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """Run preflight or materialize the generic scheduler outputs."""
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
     start = parse_date(args.start, field="start")
     end = parse_date(args.end, field="end")
+    policy = load_policy(args.policy)
+    snow_rows = read_csv_records(args.snow_inventory)
     roles, schedules = schedule_with_adaptive_roles(
-        policy=load_policy(args.policy),
+        policy=policy,
         fsc_rows=read_csv_records(args.fsc_inventory),
-        snow_rows=read_csv_records(args.snow_inventory),
+        snow_rows=snow_rows,
         station_rows=read_csv_records(args.station_metadata),
         windows=(("schedule", start, end),),
     )
+    log_selected_station_interpolations(schedules, snow_rows, policy)
     summary = write_schedule_outputs(
         args.output_dir,
         schedules["schedule"],

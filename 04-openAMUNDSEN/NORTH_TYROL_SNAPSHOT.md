@@ -32,7 +32,8 @@ been reviewed.
 
 `scheduleDAEvents.py` is the generic interface to the pure normalized-table
 scheduler in `da_event_scheduler.py`. The current North Tyrol policy is
-versioned at `policies/north_tyrol_alternating_6day_v2.yml`. It uses alternating
+versioned at `policies/north_tyrol_alternating_6day_v3.yml`; the v2 policy remains
+available unchanged for reproducibility. Version 3 uses alternating
 FSC and station-HS targets every six days from October 7 through July 31. FSC
 selection uses a stable reference footprint that excludes water and pixels that
 are nodata throughout the selected archive. The water mask must be identical in
@@ -46,8 +47,12 @@ fulfillment constraints are satisfied.
 The fixed targets are not moved. FSC and station observations are matched
 within four days so retained adjacent slots can satisfy the five-to-seven-day
 gap contract despite irregular acquisitions. Station observations are matched
-uniquely within half the model timestep of the configured daily assimilation
-time; for this 3 h setup the inclusive tolerance is 1.5 h. A missing slot
+to the unique nearest value within half the model timestep of the configured
+daily assimilation time; for this 3 h setup the inclusive tolerance is 1.5 h.
+When exactly two equally near values symmetrically bracket the model time,
+version 3 uses their arithmetic mean if both lie inside that window and their
+timestamps are no more than 24 h apart. The real source offset still controls
+candidate ranking, so exact observations are preferred. A missing slot
 remains an explicit exception and does not alter later slot types. Each
 observation type must fill at least 85% of its feasible annual targets in the
 top-level project and in every leaf with feasible support.
@@ -62,7 +67,7 @@ To inspect a normalized inventory without creating output:
 
 ```bash
 python 04-openAMUNDSEN/scheduleDAEvents.py \
-  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v3.yml \
   --fsc-inventory SNAPSHOT/inventories/fsc_scene_subdomain_quality.csv \
   --snow-inventory SNAPSHOT/inventories/snow_station_timestep_support.csv \
   --station-metadata SNAPSHOT/data_working/obs/stations/stations_snow_depth.csv \
@@ -104,10 +109,10 @@ the staged transaction; it never overrides a live lock or process.
 The refresh writes deterministic target, event, quality, leaf-selection,
 exception and shared-role audits under `raw/metadata/`. It also inventories
 exact forcing flatlines and pairs co-temporal station snow depth with the native
-EURAC pixel and 3x3 neighborhood. These tables support review only; they never
+EURAC pixel and 3x3 neighborhood. It also writes areal FSC context in fixed
+250 m elevation bands and by land-cover class, assigning native FSC pixels to
+the containing native 100 m DEM and land-cover cell without resampling. These tables support review only; they never
 replace the final `data_assimilation.assimilation_events` lists in project YAML.
-The optional areal FSC audit requires an explicitly approved elevation-band
-width and applies no hidden default.
 
 The reviewed digest-pinned core image validates all 48 regenerated leaves
 before promotion. Active DA and benchmark stations must have same-ID
@@ -138,7 +143,7 @@ Any `results`, restart state or model artifact fails final acceptance.
 ```bash
 python 04-openAMUNDSEN/finalizeNorthTyrolProjects.py \
   --setup-root /home/franz/workspace/openamundsen_da_runs/north_tyrol_subdomain_runs/north_tyrol_subdomains_100m \
-  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v2.yml \
+  --policy 04-openAMUNDSEN/policies/north_tyrol_alternating_6day_v3.yml \
   --image ghcr.io/openamundsen/openamundsen-da@sha256:REVIEWED_CORE_IMAGE_DIGEST \
   --preflight
 ```
