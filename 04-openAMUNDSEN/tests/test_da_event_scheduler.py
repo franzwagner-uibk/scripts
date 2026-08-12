@@ -1053,26 +1053,110 @@ def test_maintained_snow_output_mappings_are_added_and_mismatches_fail() -> None
         )
 
 
-def test_forcing_flatline_inventory_respects_gaps_and_minimum_length() -> None:
-    records = [
-        {
-            "date": f"2022-10-{1 + (index * 3) // 24:02d} {index * 3 % 24:02d}:00:00",
-            "temp": "273.15" if index < 8 else str(273.15 + index),
-            "precip": "0",
-        }
-        for index in range(10)
-    ]
+def test_forcing_flatline_inventory_uses_hourly_source_cadence_and_ignores_hs() -> None:
+    start = datetime(2022, 10, 1)
+    records = []
+    for index in range(50):
+        timestamp = start + timedelta(hours=index + (1 if index >= 25 else 0))
+        records.append(
+            {
+                "date": timestamp.isoformat(sep=" "),
+                "temp": "273.15",
+                "precip": "0",
+                "hs": "999",
+            }
+        )
     rows = finalizer.forcing_flatline_runs(
         records,
         station_file="Eissee.csv",
-        timestep=timedelta(hours=3),
-        minimum_samples=8,
     )
-    assert rows is not None
-    temp = next(row for row in rows if row["variable"] == "temp")
-    assert temp["station_id"] == "Eissee"
-    assert temp["sample_count"] == 8
-    assert temp["duration_hours"] == 21.0
+    assert [(row["variable"], row["duration_hours"]) for row in rows] == [
+        ("precip", 24.0),
+        ("precip", 24.0),
+        ("temp", 24.0),
+        ("temp", 24.0),
+    ]
+    assert {row["classification"] for row in rows if row["variable"] == "precip"} == {
+        "dry_zero_precip"
+    }
+    assert all(row["source_timestep_hours"] == 1.0 for row in rows)
+    assert not any(row["variable"] == "hs" for row in rows)
+
+
+def test_forcing_flatline_inventory_classifies_severe_and_rejects_nonhourly_cadence() -> None:
+    start = datetime(2022, 10, 1)
+    records = [
+        {
+            "date": (start + timedelta(hours=index)).isoformat(sep=" "),
+            "temp": "271.25",
+            "rel_hum": "84.8",
+        }
+        for index in range(169)
+    ]
+    rows = finalizer.forcing_flatline_runs(records, station_file="Eissee.csv")
+    assert {row["severity"] for row in rows} == {"severe"}
+    assert {row["duration_hours"] for row in rows} == {168.0}
+
+    with pytest.raises(ValueError, match="source cadence must be"):
+        finalizer.forcing_flatline_runs(
+            [
+                {"date": (start + timedelta(hours=3 * index)).isoformat(sep=" "), "temp": "1"}
+                for index in range(10)
+            ],
+            station_file="three_hourly.csv",
+        )
+
+
+def test_forcing_flatline_inventory_clips_projects_and_summarizes_overlaps() -> None:
+    source_rows = [
+        {
+            "station_file": "AT_LWD.Eissee.csv",
+            "station_id": "AT_LWD.Eissee",
+            "variable": variable,
+            "value": value,
+            "start_timestamp": "2018-04-05 15:00:00",
+            "end_timestamp": "2018-10-31 10:00:00",
+            "sample_count": 5012,
+            "duration_hours": 5011.0,
+            "source_timestep_hours": 1.0,
+            "zero_value": False,
+            "classification": "candidate_stuck_sensor",
+            "severity": "severe",
+        }
+        for variable, value in (
+            ("temp", 271.25),
+            ("rel_hum", 84.8),
+            ("wind_speed", 3.74),
+            ("wind_dir", 188.0),
+        )
+    ]
+    windows = {
+        "project_2017_2018": (datetime(2017, 10, 1), datetime(2018, 9, 30, 21)),
+        "project_2018_2019": (datetime(2018, 10, 1), datetime(2019, 9, 30, 21)),
+    }
+    rows = finalizer.clip_forcing_flatline_runs(
+        source_rows,
+        project_windows=windows,
+        minimum_duration=timedelta(hours=24),
+    )
+    first_project = [row for row in rows if row["project"] == "project_2017_2018"]
+    assert len(first_project) == 4
+    assert {row["end_timestamp"] for row in first_project} == {"2018-09-30 21:00:00"}
+    assert {row["sample_count"] for row in first_project} == {4279}
+    overlaps = finalizer.forcing_multivariable_overlaps(rows)
+    assert overlaps[0]["variables"] == ("rel_hum", "temp", "wind_dir", "wind_speed")
+    assert overlaps[0]["severity"] == "severe"
+    finalizer._validate_eissee_2017_2018_flatline(rows)
+
+    summary = finalizer.forcing_flatline_summary(
+        rows,
+        overlaps=overlaps,
+        cadence_rows=[{"gap_count": 2}],
+        project_windows=windows,
+    )
+    assert summary["expected_source_cadence_hours"] == 1.0
+    assert summary["projects"]["project_2017_2018"]["station_count"] == 1
+    assert summary["projects"]["project_2017_2018"]["multivariable_overlap_count"] == 1
 
 
 def test_fsc_areal_strata_keep_point_and_areal_support_separate() -> None:

@@ -19,6 +19,7 @@ on:
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
       - docs/superpowers/specs/2026-08-11-north-tyrol-scheduler-v2-design.md
       - docs/superpowers/specs/2026-08-12-north-tyrol-station-tie-v3-design.md
+      - docs/superpowers/specs/2026-08-12-north-tyrol-forcing-flatline-audit-design.md
   push:
     branches: [main]
     paths:
@@ -38,6 +39,7 @@ on:
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
       - docs/superpowers/specs/2026-08-11-north-tyrol-scheduler-v2-design.md
       - docs/superpowers/specs/2026-08-12-north-tyrol-station-tie-v3-design.md
+      - docs/superpowers/specs/2026-08-12-north-tyrol-forcing-flatline-audit-design.md
 
 permissions:
   contents: read
