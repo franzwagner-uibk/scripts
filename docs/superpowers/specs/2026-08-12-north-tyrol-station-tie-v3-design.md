@@ -40,8 +40,10 @@ none of these inputs is resampled.
 
 ## Rollout
 
-The scripts PR follows the merged core PR and pins the immutable image produced
-from that core commit. Lenovo P8 first runs a read-only preflight. A successful
+The scripts PR follows merged core commit
+`0a9c87753d1e59bd13552f0882353301ed2b8991` and pins its immutable image digest
+`sha256:8fa2bda758be2b98e88a3a2fdb616f5ef5504d9b4fe9a2d7dde4d799a47e327d`.
+Lenovo P8 first runs a read-only preflight. A successful
 preflight is followed by the existing same-filesystem transactional refresh of
 all six projects and 48 leaves. The accepted canonical setup is not changed on
 failure, and no model propagation is launched.

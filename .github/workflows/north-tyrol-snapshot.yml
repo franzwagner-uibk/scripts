@@ -61,7 +61,7 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g \
             --volume "${GITHUB_WORKSPACE}:/work:ro" \
             --workdir /work \
-            ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
+            ghcr.io/openamundsen/openamundsen-da@sha256:8fa2bda758be2b98e88a3a2fdb616f5ef5504d9b4fe9a2d7dde4d799a47e327d \
             python -m pytest -q -p no:cacheprovider \
               04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py \
               04-openAMUNDSEN/tests/test_da_event_scheduler.py
