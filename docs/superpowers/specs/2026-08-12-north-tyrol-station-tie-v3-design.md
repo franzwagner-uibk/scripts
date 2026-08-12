@@ -34,8 +34,9 @@ matching name and 24-hour span. These are validated scientific constants, not
 user-selectable openAMUNDSEN-DA settings.
 
 The canonical refresh also enables the existing areal FSC diagnostic with 250
-m elevation bands. DEM, land-cover and FSC inputs remain on their native 100 m
-horizontal grid and are never resampled.
+m elevation bands. The DEM and land-cover inputs remain on their native 100 m
+grid, while native FSC pixels are assigned to their containing terrain cell;
+none of these inputs is resampled.
 
 ## Rollout
 
