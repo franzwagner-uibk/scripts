@@ -54,7 +54,7 @@ version 3 uses their arithmetic mean if both lie inside that window and their
 timestamps are no more than 24 h apart. The real source offset still controls
 candidate ranking, so exact observations are preferred. A missing slot
 remains an explicit exception and does not alter later slot types. Each
-observation type must fill at least 85% of its feasible annual targets in the
+observation type must fill at least 80% of its feasible annual targets in the
 top-level project and in every leaf with feasible support.
 
 The scheduler treats those fulfillment limits as hard constraints. It
