@@ -4,7 +4,9 @@ on:
   pull_request:
     paths:
       - .github/workflows/north-tyrol-snapshot.yml
+      - 04-openAMUNDSEN/buildNorthTyrolLaunchKit.py
       - 04-openAMUNDSEN/buildNorthTyrolSnapshot.py
+      - 04-openAMUNDSEN/captureNorthTyrolFailureEvidence.py
       - 04-openAMUNDSEN/da_event_scheduler.py
       - 04-openAMUNDSEN/finalizeNorthTyrolProjects.py
       - 04-openAMUNDSEN/north_tyrol_snapshot.py
@@ -14,6 +16,7 @@ on:
       - 04-openAMUNDSEN/scheduleDAEvents.py
       - 04-openAMUNDSEN/tests/test_da_event_scheduler.py
       - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/tests/test_north_tyrol_launch_kit.py
       - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
       - docs/superpowers/specs/2026-08-05-da-event-scheduler-finalization-design.md
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
@@ -24,7 +27,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/north-tyrol-snapshot.yml
+      - 04-openAMUNDSEN/buildNorthTyrolLaunchKit.py
       - 04-openAMUNDSEN/buildNorthTyrolSnapshot.py
+      - 04-openAMUNDSEN/captureNorthTyrolFailureEvidence.py
       - 04-openAMUNDSEN/da_event_scheduler.py
       - 04-openAMUNDSEN/finalizeNorthTyrolProjects.py
       - 04-openAMUNDSEN/north_tyrol_snapshot.py
@@ -34,6 +39,7 @@ on:
       - 04-openAMUNDSEN/scheduleDAEvents.py
       - 04-openAMUNDSEN/tests/test_da_event_scheduler.py
       - 04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py
+      - 04-openAMUNDSEN/tests/test_north_tyrol_launch_kit.py
       - 04-openAMUNDSEN/NORTH_TYROL_SNAPSHOT.md
       - docs/superpowers/specs/2026-08-05-da-event-scheduler-finalization-design.md
       - docs/superpowers/specs/2026-08-05-minimal-snapshot-ci-design.md
@@ -66,4 +72,5 @@ jobs:
             ghcr.io/openamundsen/openamundsen-da@sha256:8fa2bda758be2b98e88a3a2fdb616f5ef5504d9b4fe9a2d7dde4d799a47e327d \
             python -m pytest -q -p no:cacheprovider \
               04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py \
-              04-openAMUNDSEN/tests/test_da_event_scheduler.py
+              04-openAMUNDSEN/tests/test_da_event_scheduler.py \
+              04-openAMUNDSEN/tests/test_north_tyrol_launch_kit.py
