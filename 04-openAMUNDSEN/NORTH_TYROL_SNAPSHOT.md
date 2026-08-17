@@ -91,6 +91,23 @@ filter, regenerates all 48 leaves and validates their steps without propagation.
 It swaps the sibling into the canonical path only after acceptance and restores
 the original on any post-swap failure.
 
+After a reviewed image is available, create launch kits with
+`buildNorthTyrolLaunchKit.py`. The generated launcher exposes the canonical
+setup at `/setup` exactly once, pins the immutable image digest and chains
+run, merge and render without an implicit overwrite. On failure it calls
+`captureNorthTyrolFailureEvidence.py`, which records manifest identities,
+status counts, hashes and representative failed batches while copying only
+small performance diagnostics. Large retention/storage ledgers are hashed and
+summarized, never duplicated into the evidence bundle.
+
+Kit creation and launch both require the promoted canonical transaction, event
+totals `38, 45, 44, 43, 46, 42`, 48 leaves, 1,833 prepared steps, 28 DA
+stations and seven holdouts. The launch-time check also requires the original
+setup inode and byte-identical configuration contract, no target-project
+runtime artifacts and an idle host before pulling and inspecting the immutable
+image. The run command then completes openAMUNDSEN-DA's conservative storage
+admission before it creates workers.
+
 The canonical station table remains documentation-shaped and does not require a
 scheduler-only `subdomain_id` column. The adapter derives membership in memory
 from each station's EPSG:25832 `x`/`y` coordinates and the accepted
@@ -198,5 +215,6 @@ docker run --rm \
   ghcr.io/openamundsen/openamundsen-da:0.9.4@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
   python -m pytest -q -p no:cacheprovider \
     04-openAMUNDSEN/tests/test_north_tyrol_snapshot.py \
-    04-openAMUNDSEN/tests/test_da_event_scheduler.py
+    04-openAMUNDSEN/tests/test_da_event_scheduler.py \
+    04-openAMUNDSEN/tests/test_north_tyrol_launch_kit.py
 ```
