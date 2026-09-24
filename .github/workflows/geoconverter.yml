@@ -1,0 +1,41 @@
+name: GeoConverter tests
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/geoconverter.yml
+      - 01-helpers/geoConverter.py
+      - 01-helpers/GEO_CONVERTER.md
+      - 01-helpers/tests/test_geo_converter.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/geoconverter.yml
+      - 01-helpers/geoConverter.py
+      - 01-helpers/GEO_CONVERTER.md
+      - 01-helpers/tests/test_geo_converter.py
+
+permissions:
+  contents: read
+
+jobs:
+  roi-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test ROI exports and original converter
+        run: |
+          docker run --rm \
+            --read-only \
+            --network none \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g \
+            --volume "${GITHUB_WORKSPACE}:/work:ro" \
+            --workdir /work \
+            ghcr.io/openamundsen/openamundsen-da@sha256:8fa2bda758be2b98e88a3a2fdb616f5ef5504d9b4fe9a2d7dde4d799a47e327d \
+            python -m pytest -q -p no:cacheprovider \
+              01-helpers/tests/test_geo_converter.py
