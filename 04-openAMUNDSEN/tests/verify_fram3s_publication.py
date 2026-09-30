@@ -29,6 +29,10 @@ def check_publication(root):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("legacy " + kind)
         source_manifest[kind] = {"path": relative, "sha256": digest(path)}
+    hidden = dest / "01-aoi/archive/.DS_Store"
+    hidden.write_text("hidden legacy metadata")
+    if not ctypes.windll.kernel32.SetFileAttributesW(str(hidden), 2):
+        raise ctypes.WinError()
     specs, paths = (
         [],
         {
@@ -129,7 +133,7 @@ def check_publication(root):
     journal = json.loads(next(report.glob("publication_*.json")).read_text(encoding="utf-8-sig"))
     assert journal["status"] == "complete" and journal["published_files"] == 1144
     assert len(journal["preserved_files"]) == 1 and target.stat().st_mtime_ns == original_mtime
-    assert len(journal["archived_files"]) == 5
+    assert len(journal["archived_files"]) == 6
     for row in journal["archived_files"]:
         assert Path(row["archive"]).stat().st_size == row["bytes"] and not Path(row["source"]).exists()
     for relative, entry in source_manifest.items():
@@ -137,6 +141,23 @@ def check_publication(root):
     for row in manifest:
         assert digest(dest / row["path"]) == row["sha256"]
     assert len([p for p in dest.rglob("*") if p.is_file()]) == 1145
+    # Simulate interruption after archival and some copies, then verify safe continuation.
+    journal_path = next(report.glob("publication_*.json"))
+    journal["status"] = "publishing"
+    journal_path.write_text(json.dumps(journal))
+    unfinished = dest / journal["copied_files"][0]["path"]
+    unfinished.write_text("unexpected changed file")
+    expected = snapshot()
+    failed = run("-Publish", "-ResumeJournal", str(journal_path))
+    assert failed.returncode and b"Publication verification failed" in failed.stderr and snapshot() == expected
+    unfinished.unlink()
+    resumed = run("-Publish", "-ResumeJournal", str(journal_path))
+    if resumed.returncode:
+        raise RuntimeError(resumed.stderr.decode(errors="replace"))
+    assert json.loads(journal_path.read_text(encoding="utf-8-sig"))["status"] == "complete"
+    assert target.stat().st_mtime_ns == original_mtime
+    for row in manifest:
+        assert digest(dest / row["path"]) == row["sha256"]
     return {
         "dry_run_unchanged": True,
         "changed_source_rejected": True,
@@ -145,7 +166,10 @@ def check_publication(root):
         "raw_sources_preserved": True,
         "terrain_kept_in_place": True,
         "verified_delivery_files": 1145,
-        "verified_archive_files": 5,
+        "verified_archive_files": 6,
+        "hidden_archive_file_verified": True,
+        "resume_rejects_changed_file": True,
+        "resume_completes_without_overwriting": True,
     }
 
 

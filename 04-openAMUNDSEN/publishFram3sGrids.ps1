@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory=$true)][string]$WorkRoot,
     [Parameter(Mandatory=$true)][string]$DestinationRoot,
     [Parameter(Mandatory=$true)][string]$RecordRoot,
-    [switch]$Publish
+    [switch]$Publish,
+    [string]$ResumeJournal
 )
 $ErrorActionPreference = 'Stop'
 $WorkRoot = (Get-Item -LiteralPath $WorkRoot).FullName
@@ -54,6 +55,61 @@ $Vectors = Read-Record 'vector_validation.json'
 if (-not $Vectors.attributes_preserved -or $Vectors.subregions -ne 90) { throw 'Vector validation failed' }
 $Core = Read-Record 'roi_context_validation.json'
 if ($Core.failures.Count -ne 0 -or $Core.comparisons -ne 50) { throw 'ROI context validation failed' }
+function Complete-Delivery($State, $Journal) {
+    function Save-State { $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Journal -Encoding UTF8 }
+    $State.published_files=0
+    foreach ($File in $State.archived_files) {
+        $Actual = Get-Item -LiteralPath $File.archive -Force
+        if ($Actual.Length -ne $File.bytes -or $Actual.LastWriteTimeUtc.ToString('o') -ne $File.last_write_utc) { throw "Archive move verification failed: $($File.archive)" }
+    }
+    $State.status='publishing'
+    Save-State
+    foreach ($File in $State.copied_files) {
+        $Source = Join-Path $OutputRoot $File.path.Replace('/','\')
+        $Target = Join-Path $DestinationRoot $File.path.Replace('/','\')
+        if (-not (Test-Path -LiteralPath $Target)) {
+            if ((Hash $Source) -ne $File.sha256) { throw "Staged file changed before copy: $Source" }
+            New-Item -ItemType Directory -Force -Path (Split-Path $Target -Parent) | Out-Null
+            Copy-Item -LiteralPath $Source -Destination $Target
+        }
+        if ((Get-Item -LiteralPath $Target).Length -ne $File.bytes -or (Hash $Target) -ne $File.sha256) {
+            throw "Publication verification failed: $Target"
+        }
+        $State.published_files++
+        if ($State.published_files % 50 -eq 0) { Save-State; Write-Output "Published and verified $($State.published_files) / $($State.copied_files.Count) files" }
+    }
+    $ActualPaths = @{}
+    foreach ($Root in $Roots.Values) {
+        foreach ($File in Get-ChildItem -LiteralPath (Join-Path $DestinationRoot $Root) -Recurse -File -Force) {
+            $ActualPaths[$File.FullName.Substring($DestinationRoot.Length+1).Replace('\','/')] = $true
+        }
+    }
+    if ($ActualPaths.Count -ne 1145) { throw "Final file count is $($ActualPaths.Count), expected 1145" }
+    foreach ($Path in $ActualPaths.Keys) { if (-not $Expected.ContainsKey($Path)) { throw "Unexpected published path: $Path" } }
+    $State.status='complete'
+    Save-State
+    $State.moves | Export-Csv -LiteralPath (Join-Path $RecordRoot "archive_paths_$($State.stamp).csv") -NoTypeInformation -Encoding UTF8
+    Write-Output "Publication complete: $Journal; $($State.preserved_files.Count) files preserved in place, $($State.copied_files.Count) replaced."
+
+}
+
+if ($ResumeJournal) {
+    if (-not $Publish) { throw 'Resume requires -Publish' }
+    $State = Get-Content -LiteralPath $ResumeJournal -Raw | ConvertFrom-Json
+    if ($State.status -notin @('archived','publishing')) { throw "Cannot resume publication state: $($State.status)" }
+    $Recorded = @{}
+    foreach ($File in @($State.preserved_files) + @($State.copied_files)) { $Recorded[$File.path] = $File }
+    if ($Recorded.Count -ne 1145) { throw 'Resume journal has an incomplete artifact list' }
+    foreach ($File in $Manifest) {
+        $Item = $Recorded[$File.path]
+        if (-not $Item -or $Item.sha256 -ne $File.sha256 -or $Item.bytes -ne $File.bytes) {
+            throw "Resume manifest differs from journal: $($File.path)"
+        }
+    }
+    # Preserve the completed preflight hashes. This continuation never writes retained terrain.
+    Complete-Delivery $State $ResumeJournal
+    exit 0
+}
 $Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $ArchiveRoot = Join-Path (Split-Path $DestinationRoot -Parent) "90-archive\grid_collection_cleanup\$Stamp"
 $Moves = @()
@@ -143,32 +199,4 @@ foreach ($Move in $Moves) {
 }
 $State.status='archived'
 Save-State
-foreach ($File in $OldFiles) {
-    $Actual = Get-Item -LiteralPath $File.archive
-    if ($Actual.Length -ne $File.bytes -or $Actual.LastWriteTimeUtc.ToString('o') -ne $File.last_write_utc -or
-        (Test-Path -LiteralPath $File.source)) { throw "Archive move verification failed: $($File.archive)" }
-}
-foreach ($File in $Copies) {
-    $Source = Join-Path $OutputRoot $File.path.Replace('/','\')
-    $Target = Join-Path $DestinationRoot $File.path.Replace('/','\')
-    if (Test-Path -LiteralPath $Target) { throw "Unexpected publication collision: $Target" }
-    New-Item -ItemType Directory -Force -Path (Split-Path $Target -Parent) | Out-Null
-    Copy-Item -LiteralPath $Source -Destination $Target
-    if ((Get-Item -LiteralPath $Target).Length -ne $File.bytes -or (Hash $Target) -ne $File.sha256) {
-        throw "Publication verification failed: $Target"
-    }
-    $State.published_files++
-    if ($State.published_files % 50 -eq 0) { Save-State; Write-Output "Published and verified $($State.published_files) / $($Copies.Count) files" }
-}
-$ActualPaths = @{}
-foreach ($Root in $Roots.Values) {
-    foreach ($File in Get-ChildItem -LiteralPath (Join-Path $DestinationRoot $Root) -Recurse -File -Force) {
-        $ActualPaths[$File.FullName.Substring($DestinationRoot.Length+1).Replace('\','/')] = $true
-    }
-}
-if ($ActualPaths.Count -ne 1145) { throw "Final file count is $($ActualPaths.Count), expected 1145" }
-foreach ($Path in $ActualPaths.Keys) { if (-not $Expected.ContainsKey($Path)) { throw "Unexpected published path: $Path" } }
-$State.status='complete'
-Save-State
-$Moves | Export-Csv -LiteralPath (Join-Path $RecordRoot "archive_paths_$Stamp.csv") -NoTypeInformation -Encoding UTF8
-Write-Output "Publication complete: $Journal; $($Preserved.Count) files preserved in place, $($Copies.Count) replaced."
+Complete-Delivery $State $Journal
