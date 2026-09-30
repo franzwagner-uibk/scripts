@@ -58,20 +58,27 @@ def check_publication(root):
         "-RecordRoot",
         str(report),
     ]
+    # PowerShell 7 runners export their module path, which Windows PowerShell 5.1
+    # cannot load. Let the child build its own compatible default module path.
+    child_env = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+
+    def run(*extra):
+        return subprocess.run(args + list(extra), capture_output=True, env=child_env)
 
     def snapshot():
         return {str(p.relative_to(dest)): digest(p) for p in dest.rglob("*") if p.is_file()}
 
     before = snapshot()
-    subprocess.run(args, check=True, capture_output=True)
+    run().check_returncode()
     assert before == snapshot()
 
     # A changed input must fail before any source is archived.
     dem = dest / paths["dem"]
     dem.write_text("changed input")
     expected = snapshot()
-    failed = subprocess.run(args + ["-Publish"], capture_output=True)
+    failed = run("-Publish")
     assert failed.returncode != 0 and snapshot() == expected
+    assert b"Source changed since staging" in failed.stderr
     assert not list(dest.rglob("archive"))
     dem.write_text("legacy dem")
 
@@ -81,12 +88,13 @@ def check_publication(root):
     conflicting = {"path": "03-landcover/raw_preserved.txt", "bytes": 0, "sha256": "unused"}
     (work / "artifact_manifest.json").write_text(json.dumps(manifest + [conflicting]))
     expected = snapshot()
-    failed = subprocess.run(args + ["-Publish"], capture_output=True)
+    failed = run("-Publish")
     assert failed.returncode != 0 and snapshot() == expected
+    assert b"Unexpected publication collision before archiving" in failed.stderr
     assert not list(dest.rglob("archive"))
     (work / "artifact_manifest.json").write_text(json.dumps(manifest))
 
-    published = subprocess.run(args + ["-Publish"], capture_output=True)
+    published = run("-Publish")
     if published.returncode:
         raise RuntimeError(published.stdout.decode(errors="replace") + published.stderr.decode(errors="replace"))
     journal = json.loads(next(report.glob("publication_*.json")).read_text(encoding="utf-8-sig"))
