@@ -17,6 +17,8 @@ There are exactly **1145 files** under the five active layer roots:
 - 15 Shapefile ZIPs under `01-aoi/<region>/buffer_<buffer>m/`.
 - Five AOI root files: `README.txt`, `aoi.gpkg`, `aoi_overview.qgz`, `aoi_overview.png` and `aoi_overview.pdf`.
 
+The README contains only CRS, cell sizes, terrain buffers, formats, layer units/ranges, NoData values and the 13 Fram3S land-cover classes. Class names follow the archived EUSALP reclassification script; these codes differ from upstream openAMUNDSEN defaults.
+
 The central GeoPackage contains `boundaries` (5 original regions), `grid_extents` (75 specifications), `roi_partitions` (30 features: inside/outside for 15 rectangles) and `subregions` (90 features with original attributes). ZIPs contain the same two-part partitions. Detailed boundaries are not rounded or simplified. Invalid Tyrol geometry is repaired with `make_valid`, as recorded outside delivery.
 
 The Tyrol 100 m / 5 km grid has bounds `(578000, 5167000, 808000, 5298000)` and 2300 columns × 1310 rows. Use the standard `tyrol/buffer_05000m/100m` paths. There is no person-specific package. The existing station-availability audit covers North Tyrol only; it does not establish East Tyrol availability.
