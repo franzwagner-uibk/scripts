@@ -1,20 +1,20 @@
 # Fram3S aligned grids
 
-The builder produces 75 stacks: five regions, three terrain contexts and five resolutions. The publisher keeps matching terrain files in place and replaces the AOI delivery after validation. Superseded files and raw sources move into a dated central archive.
+The builder produces 75 stacks: five regions, three terrain buffers and five resolutions. The publisher keeps matching terrain files in place and replaces the AOI delivery after validation. Superseded files and raw sources move into a dated central archive.
 
 ## Delivery contract
 
 - CRS: ETRS89 / UTM zone 32N, EPSG:25832, aligned from `(0, 0)`.
 - Regions: Euregio, Tyrol including North and East Tyrol, North Tyrol, South Tyrol and Trentino.
 - Resolutions: 50, 100, 250, 500 and 1000 m.
-- Contexts: 0, 5000 and 10000 m. The buffered polygon determines a rectangle snapped outward to 1000 m. All resolutions share that rectangle; 100 and 250 m cells do not nest directly.
-- **ROI always represents the original region.** Cell centers inside are 1, outside are valid 0, NoData is 255. Context variants have identical geographic core cells at each resolution.
+- Terrain buffers: 0, 5000 and 10000 m. The buffered polygon determines a rectangle snapped outward to 1000 m. All resolutions share that rectangle; 100 and 250 m cells do not nest directly.
+- **ROI always represents the original region.** Cell centers inside are 1, outside are valid 0, NoData is 255. Terrain buffer variants have identical geographic core cells at each resolution.
 - DEM, land-cover, SRF and SVF NoData is −9999. Continuous values keep their fractional precision.
 
 There are exactly **1145 files** under the five active layer roots:
 
 - 1125 GeoTIFF, ASCII and `.prj` files: five layers × 75 stacks × three files.
-- 15 Shapefile ZIPs under `01-aoi/<region>/buffer_<context>m/`.
+- 15 Shapefile ZIPs under `01-aoi/<region>/buffer_<buffer>m/`.
 - Five AOI root files: `README.txt`, `aoi.gpkg`, `aoi_overview.qgz`, `aoi_overview.png` and `aoi_overview.pdf`.
 
 The central GeoPackage contains `boundaries` (5 original regions), `grid_extents` (75 specifications), `roi_partitions` (30 features: inside/outside for 15 rectangles) and `subregions` (90 features with original attributes). ZIPs contain the same two-part partitions. Detailed boundaries are not rounded or simplified. Invalid Tyrol geometry is repaired with `make_valid`, as recorded outside delivery.
@@ -58,13 +58,13 @@ python qgisFram3sProject.py --root <native-stage>/01-aoi --records <external-rec
 python qgisFram3sProject.py --root <native-stage>/01-aoi --records <external-records> --validate-only
 ```
 
-Windows QGIS requires native Windows staging for GeoPackages; SQLite locking through WSL UNC paths is unreliable. Copy the staged AOI to a native Windows folder, generate and validate there, then copy the `.qgz` and external validation records back. All project sources are relative. Vector providers are explicitly read-only, and that setting is saved in the project. Both generation and validation verify that GeoPackage bytes remain unchanged, preventing SQLite journal-mode/header updates during normal project opening. The headless Qt runtime explicitly loads installed Windows Arial if necessary. Validation requires Arial, 75 transparent-outside ROI renderers, all vector features, 90 subregions and the opening layer set: Euregio 100 m / 5 km ROI plus Tyrol, South Tyrol and Trentino outlines. The other masks and all subregion views start off. One extent layer per region/context avoids duplicate outlines.
+Windows QGIS requires native Windows staging for GeoPackages; SQLite locking through WSL UNC paths is unreliable. Copy the staged AOI to a native Windows folder, generate and validate there, then copy the `.qgz` and external validation records back. All project sources are relative. Vector providers are explicitly read-only, and that setting is saved in the project. Both generation and validation verify that GeoPackage bytes remain unchanged, preventing SQLite journal-mode/header updates during normal project opening. The headless Qt runtime explicitly loads installed Windows Arial if necessary. Validation requires Arial, 75 transparent-outside ROI renderers, all vector features, 90 subregions and the opening layer set: Euregio 100 m / 5 km ROI plus Tyrol, South Tyrol and Trentino outlines. The other masks and all subregion views start off. One extent layer per region/buffer avoids duplicate outlines.
 
 ```text
 python buildFram3sGrids.py finalize --work /work
 ```
 
-Finalization requires exactly 1145 whitelisted files and successful QGIS evidence, validates the vectors and core-cell invariance, then hashes the final artifacts. JSONs, CSV inventories, source manifests, diagnostics, previews and logs remain outside `output/`. The overview contains five region panels showing original ROIs, internal subregion boundaries and context rectangles. Subregion outlines are clipped to each original region and have no legend entry.
+Finalization requires exactly 1145 whitelisted files and successful QGIS evidence, validates the vectors and core-cell invariance, then hashes the final artifacts. JSONs, CSV inventories, source manifests, diagnostics, previews and logs remain outside `output/`. The overview contains five region panels showing original ROIs, internal subregion boundaries and terrain buffer rectangles. Subregion outlines are clipped to each original region and have no legend entry.
 
 ## Publication and rollback
 

@@ -170,7 +170,7 @@ def validate_resolution(work: Path, resolution: int) -> list:
 
 
 def plot_overview(output: Path) -> None:
-    """Show original region ROIs and their three terrain context rectangles."""
+    """Show original region ROIs and their three terrain buffer rectangles."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -213,11 +213,11 @@ def plot_overview(output: Path) -> None:
         ax.set_ylabel("Northing (m)")
     handles = [Patch(facecolor="#c5dee1", edgecolor="#216b80", label="Original region / ROI")]
     handles += [
-        Line2D([0], [0], ls="--", color=color, label=f"{b // 1000} km terrain context") for b, color in colors.items()
+        Line2D([0], [0], ls="--", color=color, label=f"{b // 1000} km terrain buffer") for b, color in colors.items()
     ]
     fig.legend(handles=handles, loc="outside lower center", ncol=4, fontsize=10)
     fig.suptitle(
-        "Fram3S regions and terrain context extents\nETRS89 / UTM 32N · 50, 100, 250, 500 and 1,000 m", fontsize=17
+        "Fram3S regions and terrain buffer extents\nETRS89 / UTM 32N · 50, 100, 250, 500 and 1,000 m", fontsize=17
     )
     fig.savefig(root / "aoi_overview.png", dpi=170)
     fig.savefig(root / "aoi_overview.pdf")
@@ -333,7 +333,7 @@ def finish_manifest(work: Path) -> None:
 
 
 def validate_context_rois(work: Path) -> None:
-    """Compare geographic core cells across context variants at every resolution."""
+    """Compare geographic core cells across terrain buffer variants at every resolution."""
     from fram3s_grids.common import REGIONS, RESOLUTIONS
 
     rows = []

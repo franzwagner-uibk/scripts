@@ -102,18 +102,18 @@ def build(root: Path) -> Path:
             "0.45",
             visible=region in ("tyrol", "south_tyrol", "trentino"),
         )
-    grid_group = tree.addGroup("Region ROI grids and terrain context")
+    grid_group = tree.addGroup("Region ROI grids and terrain buffer")
     for region, title in labels.items():
         rg = grid_group.addGroup(title)
         for buffer_m in (0, 5000, 10000):
-            bg = rg.addGroup(f"{buffer_m // 1000} km terrain context")
+            bg = rg.addGroup(f"{buffer_m // 1000} km terrain buffer")
             subset = f'"region" = \'{region}\' AND "buffer_m" = {buffer_m} AND "resolution_m" = 100'
             vector(
                 project,
                 bg,
                 root / "aoi.gpkg",
                 "grid_extents",
-                f"{title} — {buffer_m // 1000} km context extent",
+                f"{title} — {buffer_m // 1000} km terrain buffer extent",
                 subset,
                 "#b78647",
                 "0.25",
@@ -126,7 +126,9 @@ def build(root: Path) -> Path:
                     / f"{resolution}m"
                     / f"roi_{region}_b{buffer_m:05d}_{resolution}.tif"
                 )
-                raster = QgsRasterLayer(str(path), f"{title} — {buffer_m // 1000} km context — {resolution} m ROI")
+                raster = QgsRasterLayer(
+                    str(path), f"{title} — {buffer_m // 1000} km terrain buffer — {resolution} m ROI"
+                )
                 if not raster.isValid():
                     raise RuntimeError(f"Invalid ROI raster: {path}")
                 classes = [
@@ -232,7 +234,12 @@ def validate(root: Path, records: Path, render: bool) -> dict:
         colors = {item.value: item.color for item in renderer.classes()}
         if set(colors) != {0, 1} or colors[0].alpha() != 0 or not 0 < colors[1].alpha() < 255:
             raise RuntimeError("Incorrect ROI transparency")
-    expected_visible = {"Tyrol (including East Tyrol)", "South Tyrol", "Trentino", "Euregio — 5 km context — 100 m ROI"}
+    expected_visible = {
+        "Tyrol (including East Tyrol)",
+        "South Tyrol",
+        "Trentino",
+        "Euregio — 5 km terrain buffer — 100 m ROI",
+    }
     if {layer.name() for layer in layers} != expected_visible:
         raise RuntimeError(f"Unexpected opening layers: {[layer.name() for layer in layers]}")
     with zipfile.ZipFile(root / "aoi_overview.qgz") as archive:
