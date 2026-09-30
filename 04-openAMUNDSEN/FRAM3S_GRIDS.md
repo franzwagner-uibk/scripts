@@ -1,28 +1,37 @@
 # Fram3S aligned grids
 
-`buildFram3sGrids.py` builds a staged collection of five regions, three true polygon-buffer variants and five resolutions. It does not overwrite or archive source data. `qgisFram3sProject.py` creates the portable QGIS project using an installed PyQGIS runtime. `publishFram3sGrids.ps1` verifies source hashes, archives replaced files and publishes the validated collection using native Windows network-drive access.
+The builder produces 75 stacks: five regions, three terrain contexts and five resolutions. The publisher keeps matching terrain files in place and replaces the AOI delivery after validation. Superseded files and raw sources move into a dated central archive.
 
-## Contract
+## Delivery contract
 
-- CRS: EPSG:25832; coordinate origin `(0, 0)`.
-- Regions: Euregio, Tyrol including East Tyrol, North Tyrol, South Tyrol and Trentino.
-- Buffers: 0, 5,000 and 10,000 m around the actual polygon.
-- Resolutions: 50, 100, 250, 500 and 1,000 m. Each region/buffer uses one rectangle snapped outward to 1,000 m.
-- ROI: cell center inside gives 1; outside gives valid 0. NoData is distinct.
-- DEM: area-weighted average of valid 20 m source elevations.
-- Land cover: greatest valid source area among the existing 13 classes; equal-area ties select the lowest code. Existing glacier classification is retained as part of that source.
-- SRF: `calculateSRF.py` on each parent DEM, with its existing formula, nominal 100 m and 5 km radii, elevation scaling and mean normalization. Normalization is over valid parent cells, never individual regional crops.
-- SVF: openAMUNDSEN sky-view calculation on each full parent, azimuth spacing 10 degrees and one sweep. Regional products are crops, not independently recalculated edge treatments.
+- CRS: ETRS89 / UTM zone 32N, EPSG:25832, aligned from `(0, 0)`.
+- Regions: Euregio, Tyrol including North and East Tyrol, North Tyrol, South Tyrol and Trentino.
+- Resolutions: 50, 100, 250, 500 and 1000 m.
+- Contexts: 0, 5000 and 10000 m. The buffered polygon determines a rectangle snapped outward to 1000 m. All resolutions share that rectangle; 100 and 250 m cells do not nest directly.
+- **ROI always represents the original region.** Cell centers inside are 1, outside are valid 0, NoData is 255. Context variants have identical geographic core cells at each resolution.
+- DEM, land-cover, SRF and SVF NoData is −9999. Continuous values keep their fractional precision.
 
-The parent source extent is snapped outward to 1 km. Values outside available source coverage remain NoData. Target cells with partial source coverage average the valid source fraction; that fraction is provided explicitly. Complete coverage of every ROI cell is required, and edge limitations are reported separately.
+There are exactly **1145 files** under the five active layer roots:
 
-The upstream openness implementation updates a shared minimum array inside a parallel loop. The SRF wrapper runs that calculation with one Numba thread and restores the caller's thread setting afterward. This avoids nondeterministic lost minima without changing the formula. Coarse grids still use the legacy rounded-up cell search radius; see each parent's metadata for effective distances.
+- 1125 GeoTIFF, ASCII and `.prj` files: five layers × 75 stacks × three files.
+- 15 Shapefile ZIPs under `01-aoi/<region>/buffer_<context>m/`.
+- Five AOI root files: `README.txt`, `aoi.gpkg`, `aoi_overview.qgz`, `aoi_overview.png` and `aoi_overview.pdf`.
 
-## Reproducible execution
+The central GeoPackage contains `boundaries` (5 original regions), `grid_extents` (75 specifications), `roi_partitions` (30 features: inside/outside for 15 rectangles) and `subregions` (90 features with original attributes). ZIPs contain the same two-part partitions. Detailed boundaries are not rounded or simplified. Invalid Tyrol geometry is repaired with `make_valid`, as recorded outside delivery.
 
-The validated execution environment is the existing image ID `sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723` (local tag `ghcr.io/openamundsen/openamundsen-da:0.9.4`). The source manifest records package versions. Python is `/opt/conda/envs/openamundsen_da/bin/python` in that image.
+The Tyrol 100 m / 5 km grid has bounds `(578000, 5167000, 808000, 5298000)` and 2300 columns × 1310 rows. Use the standard `tyrol/buffer_05000m/100m` paths. There is no person-specific package. The existing station-availability audit covers North Tyrol only; it does not establish East Tyrol availability.
 
-Mount the source data root read-only at `/source`, this directory read-only at `/code`, and a new local work directory read-write at `/work`. Set the working directory to `/code`, `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `NUMBA_NUM_THREADS=24` and a writable `NUMBA_CACHE_DIR` outside the checkout.
+## Numerical processing
+
+DEM uses valid-source area-weighted averages from the 20 m source. Land cover selects the class with greatest source coverage among 13 classes; ties use the lowest class code. Source glacier treatment is retained. Uncovered rectangle cells remain NoData; partial cells average only their valid source area.
+
+SRF runs `calculateSRF.py` on each parent with the existing nominal 100 m and 5 km openness radii, elevation scaling and parent-wide mean normalization. The wrapper serializes openness because its shared minimum array is unsafe in parallel, then restores the caller's thread setting. Coarse cells retain the formula's rounded-up search radius. SVF runs the openAMUNDSEN terrain routine on each parent with 10° azimuth spacing and one sweep. Regional grids are crops of these shared parents.
+
+Every ROI cell must have valid data. Source coverage fractions, potential SRF neighborhood truncation and SVF proximity flags remain in the work directory's parent rasters and diagnostics. The SVF flag is a proximity indicator, not an error bound. Cleanup does not recompute or alter terrain values.
+
+## Execution
+
+Use image `ghcr.io/openamundsen/openamundsen-da@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723`. Its Python is `/opt/conda/envs/openamundsen_da/bin/python`. Mount code and sources read-only, and a fresh work directory read-write. Set `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, a writable `NUMBA_CACHE_DIR` and an appropriate `NUMBA_NUM_THREADS` limit.
 
 ```text
 python buildFram3sGrids.py prepare --source /source --work /work
@@ -34,54 +43,49 @@ python buildFram3sGrids.py resolution --work /work --resolution 50
 python buildFram3sGrids.py finish --work /work
 ```
 
-Run the QGIS script with the installed QGIS Python launcher:
+For cleanup of the previous buffered-ROI collection, reuse its completed local build:
 
 ```text
-python qgisFram3sProject.py --root <work>/output/01-aoi
-python qgisFram3sProject.py --root <published>/01-aoi --validate-only
+python buildFram3sGrids.py cleanup --source /previous-work --work /fresh-work
 ```
 
-After QGIS generation, refresh the artifact manifest with `finish`. Source and output directories must be different. Use a fresh work directory for changed sources or processing code; checkpoints support continuing interrupted work with the same inputs and implementation, not mixing revisions.
+This verifies hashes of all 900 non-ROI files, hard-links them into staging, preserves geometry, regenerates 75 masks, validates all raster pairs against the parent grids and rebuilds vectors and overview. Both work directories must be on the same local filesystem and mounted at stable paths. Do not modify linked terrain files. Use a fresh work directory; completed checkpoints must not be reused across changed code or inputs.
 
-## Outputs and review
+Generate and reopen the project in separate native QGIS processes:
 
-The work directory contains source hashes, source-pixel statistics, parent rasters, per-resolution validation, and a publishable `output/` subtree. Layer folders retain their established names. Each region/buffer/resolution contains GeoTIFF and ASCII grids. ASCII uses nine significant digits and explicit projection sidecars.
+```text
+python qgisFram3sProject.py --root <native-stage>/01-aoi --records <external-records>
+python qgisFram3sProject.py --root <native-stage>/01-aoi --records <external-records> --validate-only
+```
 
-AOI output includes all boundary/buffer/extent geometries, ROI partition Shapefile ZIPs, a 90-feature subregion GeoPackage with original attributes, the map PNG/PDF, the QGIS project, and the machine-readable grid inventory. The QGIS project uses relative paths and references active subregion files, not archived paths.
+Windows QGIS requires native Windows staging for GeoPackages; SQLite locking through WSL UNC paths is unreliable. Copy the staged AOI to a native Windows folder, generate and validate there, then copy the `.qgz` and external validation records back. All project sources are relative. The headless Qt runtime explicitly loads installed Windows Arial if necessary. Validation requires Arial, 75 transparent-outside ROI renderers, all vector features, 90 subregions and the opening layer set: Euregio 100 m / 5 km ROI plus Tyrol, South Tyrol and Trentino outlines. The other masks and all subregion views start off. One extent layer per region/context avoids duplicate outlines.
 
-The work directory's `diagnostics/` contains parent statistics, coverage and terrain maps, and land-cover change summaries. Class areas are compared over the original source rectangle, clipping target edge-cell areas to that footprint. The change map compares delivered dominant-area classes with nearest source classes as a diagnostic baseline. Every panel shows the fraction of differing target cells within the same 1 km display grid and uses the same color scale. Panel percentages refer to all comparable target cells at that resolution.
+```text
+python buildFram3sGrids.py finalize --work /work
+```
 
-The Kathi core mask uses the original North Tyrol boundary on the 100 m grid with a 5 km context envelope: `(578000, 5175000, 784000, 5298000)`, 2060 columns by 1230 rows. It differs intentionally from the buffered region's ROI mask.
+Finalization requires exactly 1145 whitelisted files and successful QGIS evidence, validates the vectors and core-cell invariance, then hashes the final artifacts. JSONs, CSV inventories, source manifests, diagnostics, previews and logs remain outside `output/`. The overview contains five region panels showing original ROIs and context rectangles.
 
-Quality mask bits are additive: 1 = missing DEM, 2 = partial source coverage, 4 = potential SRF neighborhood truncation, 8 = proximity within 5 km to missing terrain for SVF review. The SRF flag uses a conservative square neighborhood. The SVF flag is not a quantitative error bound or proof that more distant cells are unaffected.
+## Publication and rollback
 
-Archive and publish only after all 75 stacks pass validation, vector/subregion preservation is verified, and QGIS opens all layers. Preserve raw land-cover/glacier/forest inputs. Archive legacy generated grids and all old AOI contents with hashes and a reversible old-to-new path manifest. Keep historical model runs unchanged.
+```text
+powershell -File publishFram3sGrids.ps1 -WorkRoot <work> -DestinationRoot F:\fram3s\01-data -RecordRoot <records>
+powershell -File publishFram3sGrids.ps1 -WorkRoot <work> -DestinationRoot F:\fram3s\01-data -RecordRoot <records> -Publish
+```
+
+The first call checks structural prerequisites without changing data. Publication verifies original input hashes, hashes every retained terrain file against staging and hashes replacements before moving anything. Existing terrain that differs or unexpected active files stop publication before archive moves. New terrain files may be published into an empty delivery; replacing existing terrain is a separate operation.
+
+The publisher moves the old AOI, existing layer archives, raw land-cover/forest/glacier folders, redundant XMLs and layer READMEs into `fram3s/90-archive/grid_collection_cleanup/<UTC timestamp>/`, preserving paths relative to `01-data`. It writes a journal before moves. Same-volume moves are checked against a complete path, byte-size and modification-time inventory; raw archive files are not all rehashed. The four original processing inputs are rehashed before moving. Every retained delivery file and every copied file is checked with SHA-256; copied files are checked again at destination. Final file paths must match the whitelist exactly.
+
+Reopen the published QGIS project in a fresh process with validation output outside delivery. Check the published whitelist again after QGIS closes. For rollback, move only the journal's copied files aside and reverse its archive moves. Keep retained terrain files and unlisted files untouched. An interrupted publication must be reconciled from its journal before another run.
+
+To rebuild from originals after central archival, point `--source` at the dated central archive and use `--archive-stamp` for the earlier per-layer archive timestamp. This reconstructs the four original paths into a fresh local input cache and records their provenance.
 
 ## Tests
 
 ```text
 python -m pytest -q tests/test_fram3s_grids.py
+python tests/verify_fram3s_publication.py
 ```
 
-Tests cover outward snapping, weighted aggregation, categorical ties and missing data, source-edge coverage, ROI partition behavior and SRF numerical reproducibility. Production validation additionally reads every export back and compares it with its parent crop.
-
-## Rebuilding after archiving
-
-The originals remain in the publication timestamp's archives. On a fresh work directory, use:
-
-```text
-python buildFram3sGrids.py prepare --source /source --archive-stamp <timestamp> --work /work
-```
-
-This reconstructs the four required source paths in a local snapshot and records their archived provenance. Use the archive timestamp from the publication journal. For slow mounted I/O, an existing local snapshot may be used only after its hashes have been verified against the authoritative source files.
-
-On Windows, validate the publication prerequisites first, then pass `-Publish` for the authorized publication:
-
-```text
-powershell -File publishFram3sGrids.ps1 -WorkRoot <work> -DestinationRoot F:\fram3s\01-data -RecordRoot <report>
-powershell -File publishFram3sGrids.ps1 -WorkRoot <work> -DestinationRoot F:\fram3s\01-data -RecordRoot <report> -Publish
-```
-
-The journal is written before archival moves. It records every source-to-archive move and each archived file's SHA-256. No publication collision is overwritten. If publication is interrupted, use the journal and artifact manifest to identify the generated files, move those aside, then reverse the recorded archive moves. Do not restore by deleting unlisted files.
-
-Windows QGIS cannot reliably open GeoPackages through the WSL UNC filesystem because of SQLite locking. Generate and check the project against a native Windows staging copy of the referenced AOI files, then copy the project back. Relative paths are verified in the project XML. Reopen the published project directly on the Windows drive to validate the final location.
+The second command requires Windows. Numerical tests cover alignment, area aggregation, categorical ties, NoData, source edges, core-cell invariance, independent ASCII metadata, the delivery whitelist and SRF reproducibility. The Windows fixture covers dry runs, changed input/terrain rejection, unexpected-file rejection, raw-source archival, unchanged terrain and all 1145 final hashes, including Windows 8.3 paths. GitHub Actions runs both jobs. Production validation additionally checks every full raster export and all detailed vector partitions.

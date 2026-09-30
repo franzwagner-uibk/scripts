@@ -8,7 +8,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 
-from fram3s_grids.common import RESOLUTIONS, ROOTS, raster_path, save_json
+from fram3s_grids.common import RESOLUTIONS, save_json
 
 
 def raster_diagnostics(work: Path, report: Path) -> dict:
@@ -45,8 +45,8 @@ def raster_diagnostics(work: Path, report: Path) -> dict:
     save_json(report / "parent_statistics.json", rows)
     output = work / "output"
     root = output / "01-aoi"
-    core = gpd.read_file(root / "aoi_overview.gpkg", layer="boundaries")
-    core = core[(core.region == "euregio") & (core.buffer_m == 0)]
+    core = gpd.read_file(root / "aoi.gpkg", layer="boundaries")
+    core = core[core.region == "euregio"]
     fig, axes = plt.subplots(2, 3, figsize=(13, 12), layout="constrained")
     kinds = [
         ("dem", "Elevation (m)", "terrain"),
@@ -57,11 +57,7 @@ def raster_diagnostics(work: Path, report: Path) -> dict:
         ("terrain_quality", "Terrain-quality bit flags", "magma"),
     ]
     for ax, (kind, title, cmap) in zip(axes.flat, kinds):
-        path = (
-            raster_path(output, kind, "euregio", 10000, 100)
-            if kind in ROOTS
-            else (root / "euregio/buffer_10000m/100m/quality" / f"{kind}.tif")
-        )
+        path = work / "parents/100m" / f"{kind}.tif"
         with rasterio.open(path) as src:
             values = src.read(1, masked=True, out_shape=(src.height // 3, src.width // 3))
             bounds = src.bounds
@@ -78,7 +74,7 @@ def raster_diagnostics(work: Path, report: Path) -> dict:
         ax.tick_params(labelsize=7)
         fig.colorbar(image, ax=ax, shrink=0.7)
     fig.suptitle(
-        "Fram3S processing diagnostics: Euregio, 10 km buffer, 100 m\nBlack outline: original Euregio boundary",
+        "Fram3S processing diagnostics: shared 100 m parent\nBlack outline: original Euregio boundary",
         fontsize=14,
     )
     fig.savefig(report / "processing_diagnostics.png", dpi=150)
@@ -164,9 +160,7 @@ def land_cover_changes(work: Path, report: Path) -> None:
         orientation="horizontal",
         label="Fraction of target cells differing\nwithin each 1 km display cell",
     )
-    fig.suptitle(
-        "Dominant-area land cover versus nearest source class\nCommon 1 km display grid and fraction scale"
-    )
+    fig.suptitle("Dominant-area land cover versus nearest source class\nCommon 1 km display grid and fraction scale")
     fig.savefig(report / "land_cover_changes.png", dpi=150)
     fig.savefig(report / "land_cover_changes.pdf")
     plt.close(fig)
@@ -178,39 +172,25 @@ def land_cover_changes(work: Path, report: Path) -> None:
 
 
 def write_collection_readmes(work: Path) -> None:
-    """Explain active paths, source preservation and model-grid conventions."""
-    output = work / "output"
-    for kind, root in ROOTS.items():
-        text = (
-            "Fram3S aligned spatial inputs\n\n"
-            "Regions: euregio, tyrol (including East Tyrol), north_tyrol, south_tyrol, trentino.\n"
-            "Structure: <region>/buffer_00000m|buffer_05000m|buffer_10000m/<resolution>m/.\n"
-            "Resolutions: 50, 100, 250, 500, 1000 m. CRS: EPSG:25832.\n"
-            "Each region/buffer has a common rectangle snapped outward to 1 km boundaries.\n"
-            "Buffers expand the actual region polygon; ROI=1 uses the cell-center rule.\n"
-            "GeoTIFF and model ASCII have the same grid and values. Coordinates are aligned;\n"
-            "continuous raster values retain their fractional precision.\n\n"
-            "The full inventory, QGIS project, overview and source manifest are in 01-aoi.\n"
-            "Legacy generated datasets are retained in timestamped archive folders.\n"
-            "Raw land-cover, forest and glacier source collections remain available.\n"
-            "Original source inputs and archive hashes are documented in the publication record\n"
-            "under workspace/context/plans/open/fram3s_grid_alignment_processing.\n\n"
-            "DEM uses valid-source area averages; land cover uses greatest covered class area.\n"
-            "SRF follows calculateSRF.py at each resolution, normalized once on its parent.\n"
-            "SVF is calculated on the shared parent, then cropped.\n"
-            "The 10 km variants include terrain-edge limitations. Consult AOI quality rasters:\n"
-            "flags 1=missing DEM, 2=partial source coverage, 4=SRF context proximity,\n"
-            "8=SVF proximity indicator (not a quantitative error bound).\n"
-        )
-        if kind == "roi":
-            text += (
-                "\nOpen aoi_overview.qgz in QGIS. All paths are relative.\n"
-                "Subregions: subregions/subregions_25832.gpkg, 90 polygons with original attributes.\n"
-                "Province boundaries are derived from the archived avalanche-report regions.\n"
-                "North Tyrol is separate from Tyrol including East Tyrol.\n"
-                "Vector GeoPackages contain boundary, extent and ROI partition layers.\n"
-                "Shapefile ZIPs contain the two-feature ROI partition.\n"
-                "For Kathi use kathi_north_tyrol_100m: original North Tyrol as the core ROI,\n"
-                "with the larger 5 km context grid. Its ROI differs from the true buffered ROI.\n"
-            )
-        (output / root / "README.txt").write_text(text)
+    """Write the single delivery guide; provenance and diagnostics stay outside delivery."""
+    (work / "output/01-aoi/README.txt").write_text(
+        "Fram3S aligned spatial inputs\n\n"
+        "CRS: ETRS89 / UTM zone 32N (EPSG:25832). Resolutions: 50, 100, 250, 500, 1000 m.\n"
+        "Regions: Euregio, Tyrol (North + East Tyrol), North Tyrol, South Tyrol, Trentino.\n"
+        "Paths: <layer>/<region>/buffer_00000m|buffer_05000m|buffer_10000m/<resolution>m/.\n"
+        "Layers: 01-aoi (roi), 03-landcover (lc), 05-dem, 06-srf, 07-svf.\n"
+        "ROI=1 denotes cell centers in the ORIGINAL region; outside cells are valid 0.\n"
+        "The 0/5/10 km contexts change only the surrounding terrain rectangle, snapped to 1 km.\n"
+        "All resolutions share aligned coordinates; 100 and 250 m cells do not nest exactly.\n"
+        "GeoTIFF, ASCII and required .prj files are supplied. ROI NoData=255; other layers=-9999.\n"
+        "DEM, SRF and SVF retain continuous values. LC retains classes 1..13.\n\n"
+        "aoi.gpkg: boundaries (5), grid_extents (75), roi_partitions (30), subregions (90).\n"
+        "Each context directory has one Shapefile ZIP partitioning its rectangle into ROI=1/0.\n"
+        "Open aoi_overview.qgz in QGIS: relative paths, Arial labels, Euregio 100 m / 5 km view.\n"
+        "The overview PNG/PDF shows original regions and context rectangles.\n\n"
+        "Tyrol 100 m / 5 km: 578000, 5167000 : 808000, 5298000; 2300 columns x 1310 rows.\n"
+        "The station-availability audit concerns North Tyrol only, not East Tyrol.\n"
+        "Terrain edge/source limitations remain documented in the external processing records.\n"
+        "Records: workspace/context/plans/open/fram3s_grid_alignment_processing.\n"
+        "Superseded data and raw sources: fram3s/90-archive/grid_collection_cleanup/<date>/.\n"
+    )

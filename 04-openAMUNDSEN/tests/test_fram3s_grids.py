@@ -82,3 +82,98 @@ def test_srf_import_has_no_log_file_side_effect(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert not list(tmp_path.glob("*.log"))
+
+
+def test_context_changes_extent_but_not_original_roi():
+    from fram3s_grids.geometry import variants
+    from fram3s_grids.common import REGIONS
+
+    original = box(120, 250, 1720, 1880)
+    rows = list(variants(dict.fromkeys(REGIONS, original)))[:3]
+    assert [row[1] for row in rows] == [0, 5000, 10000]
+    assert all(row[2].equals(original) for row in rows)
+    assert rows[0][3] == (0, 0, 2000, 2000)
+    assert rows[1][3] == (-5000, -5000, 7000, 7000)
+    cores = []
+    for _, _, geom, bounds in rows:
+        shape, transform = grid(bounds, 100)
+        values = rasterize([(geom, 1)], out_shape=shape, transform=transform, dtype="uint8")
+        yy, xx = np.nonzero(values)
+        cores.append(set(zip(transform.c + (xx + 0.5) * 100, transform.f - (yy + 0.5) * 100)))
+    assert cores[0] == cores[1] == cores[2]
+
+
+def test_ascii_is_self_contained_without_optional_xml(tmp_path):
+    import rasterio
+    from fram3s_grids.common import write_tif, export_ascii
+
+    for name, values, nodata in [
+        ("roi", np.array([[0, 1], [1, 0]], dtype="uint8"), 255),
+        ("dem", np.array([[12.3456, -9999], [27.891, 0]], dtype="float32"), -9999),
+    ]:
+        path = tmp_path / f"{name}.tif"
+        transform = from_origin(578000, 5298000, 100, 100)
+        write_tif(path, values, transform, nodata=nodata)
+        asc = export_ascii(path)
+        assert not list(tmp_path.glob("*.aux.xml"))
+        with rasterio.open(asc) as src:
+            assert src.crs.to_epsg() == 25832 and src.nodata == nodata and src.transform == transform
+            np.testing.assert_allclose(src.read(1), values, rtol=1e-7, atol=1e-6)
+
+
+def test_delivery_whitelist_excludes_diagnostics_and_person_packages():
+    from fram3s_grids.common import REGIONS, BUFFERS, RESOLUTIONS
+    from fram3s_grids.cleanup import expected_files
+
+    specs = [
+        {"region": region, "buffer_m": buffer_m, "resolution_m": res}
+        for region in REGIONS
+        for buffer_m in BUFFERS
+        for res in RESOLUTIONS
+    ]
+    paths = expected_files(specs)
+    assert len(paths) == 1145
+    assert sum(path.endswith(".zip") for path in paths) == 15
+    assert sum(path.endswith(".tif") for path in paths) == 375
+    assert not any("quality" in path or "kathi" in path or path.endswith((".json", ".aux.xml")) for path in paths)
+
+
+def test_central_vectors_preserve_attributes_and_partitions(tmp_path):
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import MultiPolygon
+    from fram3s_grids.geometry import build_geometry
+    from fram3s_grids.delivery import validate_vectors
+
+    source = tmp_path / "sources/vectors"
+    provinces = source / "01-aoi/PROVINCE_BOUNDARY/province_boundary_4326.gpkg"
+    provinces.parent.mkdir(parents=True)
+    geometries = [
+        MultiPolygon([box(600000, 5230000, 620000, 5250000), box(650000, 5200000, 660000, 5210000)]),
+        box(620000, 5180000, 640000, 5200000),
+        box(620000, 5160000, 640000, 5180000),
+    ]
+    gpd.GeoDataFrame({"province": ["tyrol", "south_tyrol", "trentino"]}, geometry=geometries, crs="EPSG:25832").to_crs(
+        4326
+    ).to_file(provinces, driver="GPKG")
+    original = gpd.GeoDataFrame(
+        {
+            "id": [f"AT-{i}" for i in range(90)],
+            "province": ["tyrol"] * 90,
+            "country": ["AT"] * 90,
+            "original_note": [None if i % 2 else "retained" for i in range(90)],
+        },
+        geometry=[box(601000 + i * 100, 5231000, 601080 + i * 100, 5231080) for i in range(90)],
+        crs="EPSG:25832",
+    ).to_crs(4326)
+    subpath = source / "01-aoi/SUBREGIONS/raw/subregions_avalanche_report_4326_raw.gpkg"
+    subpath.parent.mkdir(parents=True)
+    original.to_file(subpath, driver="GPKG")
+    specs = build_geometry(source, tmp_path / "output", tmp_path)
+    assert len(specs) == 75
+    assert len(list((tmp_path / "output").rglob("*.gpkg"))) == 1
+    assert len(list((tmp_path / "output").rglob("*.zip"))) == 15
+    assert not list((tmp_path / "output").rglob("*.shp")) and not list((tmp_path / "output").rglob("*.json"))
+    exported = gpd.read_file(tmp_path / "output/01-aoi/aoi.gpkg", layer="subregions")
+    pd.testing.assert_frame_equal(original.drop(columns="geometry"), exported.drop(columns="geometry"))
+    assert validate_vectors(tmp_path)["attributes_preserved"]

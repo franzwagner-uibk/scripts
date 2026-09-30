@@ -24,7 +24,7 @@ from fram3s_grids.processing import SOURCES, prepare_parent, prepare_sources, te
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "resolution", "finish"))
+    parser.add_argument("command", choices=("prepare", "resolution", "finish", "cleanup", "finalize"))
     parser.add_argument("--source", type=Path)
     parser.add_argument("--archive-stamp", help="Read archived originals after publication")
     parser.add_argument("--work", type=Path, required=True)
@@ -47,7 +47,7 @@ def main() -> None:
                 if target.exists():
                     raise FileExistsError(f"Use a fresh work directory: {target}")
                 shutil.copy2(original, target)
-        build_geometry(source_root, args.work / "output")
+        build_geometry(source_root, args.work / "output", args.work)
         manifest = prepare_sources(source_root, args.work)
         if args.archive_stamp:
             for kind, relative in SOURCES.items():
@@ -83,6 +83,16 @@ def main() -> None:
         )
         if failures:
             raise RuntimeError(json.dumps(failures))
+    elif args.command == "cleanup":
+        if args.source is None:
+            parser.error("cleanup requires --source pointing to the completed previous work directory")
+        from fram3s_grids.cleanup import cleanup_existing
+
+        cleanup_existing(args.source, args.work)
+    elif args.command == "finalize":
+        from fram3s_grids.cleanup import finalize
+
+        finalize(args.work)
     else:
         plot_overview(args.work / "output")
         raster_diagnostics(args.work, args.work / "diagnostics")

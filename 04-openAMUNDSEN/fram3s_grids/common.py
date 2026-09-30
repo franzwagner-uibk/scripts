@@ -97,6 +97,7 @@ def export_ascii(path: Path) -> Path:
     from rasterio.shutil import copy
 
     target = path.with_suffix(".asc")
-    copy(path, target, driver="AAIGrid", SIGNIFICANT_DIGITS=9)
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"):
+        copy(path, target, driver="AAIGrid", SIGNIFICANT_DIGITS=9)
     target.with_suffix(".prj").write_text(rasterio.crs.CRS.from_string(CRS).to_wkt() + "\n")
     return target

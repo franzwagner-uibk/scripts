@@ -1,5 +1,6 @@
 """Authoritative boundaries, buffers, ROI partitions and subregion exports."""
 
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -34,45 +35,40 @@ def read_regions(source: Path) -> tuple:
 
 
 def variants(regions: dict):
-    """Yield every region and true polygon buffer with its shared envelope."""
+    """Keep the original ROI; use the buffered boundary only to set context bounds."""
     for name in REGIONS:
         for buffer_m in BUFFERS:
             geom = regions[name].buffer(buffer_m, quad_segs=64) if buffer_m else regions[name]
-            yield name, buffer_m, geom, envelope(geom.bounds)
+            yield name, buffer_m, regions[name], envelope(geom.bounds)
 
 
-def build_geometry(source: Path, output: Path) -> list:
-    """Write vector products and return the 75 authoritative grid specifications."""
+def build_geometry(source: Path, output: Path, records: Path) -> list:
+    """Write the central GeoPackage, 15 partition ZIPs and external grid records."""
     root = output / "01-aoi"
     root.mkdir(parents=True, exist_ok=True)
+    gpkg = root / "aoi.gpkg"
+    if gpkg.exists():
+        raise FileExistsError(f"Use a fresh AOI staging directory: {gpkg}")
     regions, repairs = read_regions(source)
-    specifications, boundaries, extents = [], [], []
+    specifications, extents, partitions = [], [], []
     for name, buffer_m, geom, bounds in variants(regions):
         rectangle = box(*bounds)
         if not rectangle.covers(geom) or not geom.is_valid:
             raise ValueError(f"Invalid target geometry: {name}, {buffer_m}")
-        folder = variant_dir(root, name, buffer_m) / "vectors"
+        folder = variant_dir(root, name, buffer_m)
         folder.mkdir(parents=True, exist_ok=True)
         prefix = domain(name, buffer_m)
-        gpkg = folder / f"{prefix}.gpkg"
-        if gpkg.exists():
-            gpkg.unlink()
-        attrs = {"region": [name], "buffer_m": [buffer_m]}
-        gpd.GeoDataFrame(attrs, geometry=[geom], crs=CRS).to_file(gpkg, layer="boundary", driver="GPKG")
-        gpd.GeoDataFrame(attrs, geometry=[rectangle], crs=CRS).to_file(gpkg, layer="extent", driver="GPKG")
         partition = gpd.GeoDataFrame({"ROI": [1, 0]}, geometry=[geom, rectangle.difference(geom)], crs=CRS)
-        if partition.geometry.iloc[0].intersection(partition.geometry.iloc[1]).area > 0.001:
-            raise ValueError("ROI partition overlaps")
-        if unary_union(partition.geometry).symmetric_difference(rectangle).area > 0.001:
-            raise ValueError("ROI partition does not cover rectangle")
-        partition.to_file(gpkg, layer="roi_partition", driver="GPKG")
-        shpdir = folder / "shapefile"
-        shpdir.mkdir(exist_ok=True)
-        partition.to_file(shpdir / f"{prefix}.shp", driver="ESRI Shapefile", encoding="UTF-8")
-        with zipfile.ZipFile(folder / f"{prefix}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-            for item in sorted(shpdir.glob(f"{prefix}.*")):
-                archive.write(item, item.name)
-        boundaries.append({"region": name, "buffer_m": buffer_m, "geometry": geom})
+        with tempfile.TemporaryDirectory() as temporary:
+            shpdir = Path(temporary)
+            partition.to_file(shpdir / f"{prefix}.shp", driver="ESRI Shapefile", encoding="UTF-8")
+            with zipfile.ZipFile(folder / f"{prefix}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                for item in sorted(shpdir.glob(f"{prefix}.*")):
+                    archive.write(item, item.name)
+        partitions.extend(
+            {"region": name, "buffer_m": buffer_m, "ROI": int(row.ROI), "geometry": row.geometry}
+            for _, row in partition.iterrows()
+        )
         for res in RESOLUTIONS:
             shape, _ = grid(bounds, res)
             spec = {
@@ -86,30 +82,27 @@ def build_geometry(source: Path, output: Path) -> list:
             }
             specifications.append(spec)
             extents.append({**{key: val for key, val in spec.items() if key != "bounds"}, "geometry": rectangle})
-    overview = root / "aoi_overview.gpkg"
-    if overview.exists():
-        overview.unlink()
-    gpd.GeoDataFrame(boundaries, crs=CRS).to_file(overview, layer="boundaries", driver="GPKG")
-    gpd.GeoDataFrame(extents, crs=CRS).to_file(overview, layer="grid_extents", driver="GPKG")
+    boundaries = [{"region": name, "geometry": regions[name]} for name in REGIONS]
+    gpd.GeoDataFrame(boundaries, crs=CRS).to_file(gpkg, layer="boundaries", driver="GPKG")
+    gpd.GeoDataFrame(extents, crs=CRS).to_file(gpkg, layer="grid_extents", driver="GPKG")
+    gpd.GeoDataFrame(partitions, crs=CRS).to_file(gpkg, layer="roi_partitions", driver="GPKG")
     subregions = gpd.read_file(source / "01-aoi/SUBREGIONS/raw/subregions_avalanche_report_4326_raw.gpkg").to_crs(CRS)
     if len(subregions) != 90 or not subregions.geometry.is_valid.all():
         raise ValueError("Subregion count or geometry differs from audited source")
-    north_ids = subregions.loc[subregions.geometry.intersection(regions["north_tyrol"]).area > 0, "id"].tolist()
-    subdir = root / "subregions"
-    subdir.mkdir(exist_ok=True)
-    subpath = subdir / "subregions_25832.gpkg"
-    if subpath.exists():
-        subpath.unlink()
-    subregions.to_file(subpath, layer="subregions", driver="GPKG")
+    north_ids = subregions.loc[
+        (subregions.province == "tyrol") & (subregions.geometry.intersection(regions["north_tyrol"]).area > 0), "id"
+    ].tolist()
+    subregions.to_file(gpkg, layer="subregions", driver="GPKG")
     save_json(
-        root / "geometry_validation.json",
+        records / "geometry_validation.json",
         {
             "repairs": repairs,
             "subregions": len(subregions),
             "north_tyrol_subregion_ids": north_ids,
-            "polygon_variants": len(boundaries),
+            "polygon_variants": 15,
             "grid_stacks": len(specifications),
+            "roi_rule": "original region cell center",
         },
     )
-    save_json(root / "grid_specifications.json", specifications)
+    save_json(records / "grid_specifications.json", specifications)
     return specifications
