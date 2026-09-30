@@ -49,6 +49,8 @@ The work directory contains source hashes, source-pixel statistics, parent raste
 
 AOI output includes all boundary/buffer/extent geometries, ROI partition Shapefile ZIPs, a 90-feature subregion GeoPackage with original attributes, the map PNG/PDF, the QGIS project, and the machine-readable grid inventory. The QGIS project uses relative paths and references active subregion files, not archived paths.
 
+The work directory's `diagnostics/` contains parent statistics, coverage and terrain maps, and land-cover change summaries. Class areas are compared over the original source rectangle, clipping target edge-cell areas to that footprint. The change map compares delivered dominant-area classes with nearest source classes as a diagnostic baseline; a colored display block contains at least one changed target cell. Its percentages refer to individual comparable target cells.
+
 The Kathi core mask uses the original North Tyrol boundary on the 100 m grid with a 5 km context envelope: `(578000, 5175000, 784000, 5298000)`, 2060 columns by 1230 rows. It differs intentionally from the buffered region's ROI mask.
 
 Quality mask bits are additive: 1 = missing DEM, 2 = partial source coverage, 4 = potential SRF neighborhood truncation, 8 = proximity within 5 km to missing terrain for SVF review. The SRF flag uses a conservative square neighborhood. The SVF flag is not a quantitative error bound or proof that more distant cells are unaffected.

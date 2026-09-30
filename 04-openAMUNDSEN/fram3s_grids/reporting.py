@@ -1,5 +1,7 @@
 """Diagnostic summaries and user-facing collection documentation."""
 
+import csv
+import json
 from pathlib import Path
 
 import geopandas as gpd
@@ -82,7 +84,89 @@ def raster_diagnostics(work: Path, report: Path) -> dict:
     fig.savefig(report / "processing_diagnostics.png", dpi=150)
     fig.savefig(report / "processing_diagnostics.pdf")
     plt.close(fig)
+    land_cover_changes(work, report)
     return {"resolutions": rows}
+
+
+def land_cover_changes(work: Path, report: Path) -> None:
+    """Compare class areas over the source footprint and map aggregation changes."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+    from rasterio.warp import Resampling, reproject
+
+    source = json.loads((work / "source_manifest.json").read_text())["lc"]
+    xmin, ymin, xmax, ymax = source["bounds"]
+    area_rows, change_rows = [], []
+    fig, axes = plt.subplots(2, 3, figsize=(13, 11), layout="constrained")
+    for ax, res in zip(axes.flat, RESOLUTIONS):
+        with rasterio.open(work / "parents" / f"{res}m/lc.tif") as target:
+            classes = target.read(1)
+            transform = target.transform
+            # Clip edge-cell areas to the original source rectangle, so both area
+            # totals cover exactly the same footprint rather than the padded grid.
+            left = transform.c + np.arange(target.width) * res
+            top = transform.f - np.arange(target.height) * res
+            widths = np.maximum(0, np.minimum(left + res, xmax) - np.maximum(left, xmin))
+            heights = np.maximum(0, np.minimum(top, ymax) - np.maximum(top - res, ymin))
+            weights = heights[:, None] * widths[None, :] / 1e6
+            for code in range(1, 14):
+                before = source["class_counts"][str(code)] * 20**2 / 1e6
+                after = float(weights[classes == code].sum())
+                area_rows.append(
+                    {
+                        "resolution_m": res,
+                        "class": code,
+                        "source_area_km2": before,
+                        "target_area_km2": after,
+                        "change_km2": after - before,
+                        "change_percent": 100 * (after - before) / before,
+                    }
+                )
+            nearest = np.full(classes.shape, -9999, dtype="int16")
+            with rasterio.open(work / "sources/lc.tif") as original:
+                reproject(
+                    rasterio.band(original, 1),
+                    nearest,
+                    dst_transform=transform,
+                    dst_crs=target.crs,
+                    dst_nodata=-9999,
+                    resampling=Resampling.nearest,
+                )
+            valid = np.isin(classes, np.arange(1, 14)) & np.isin(nearest, np.arange(1, 14))
+            changed = (classes != nearest) & valid
+            change_rows.append(
+                {
+                    "resolution_m": res,
+                    "comparable_cells": int(valid.sum()),
+                    "different_cells": int(changed.sum()),
+                    "different_percent": 100 * float(changed.sum()) / int(valid.sum()),
+                }
+            )
+            # Aggregate for display so sparse changes remain visible at all resolutions.
+            stride = max(1, target.width // 500)
+            padded_shape = tuple(int(np.ceil(size / stride)) * stride for size in valid.shape)
+            displayed = np.zeros(padded_shape, dtype="uint8")
+            displayed[: target.height, : target.width] = changed
+            displayed = displayed.reshape(padded_shape[0] // stride, stride, padded_shape[1] // stride, stride).max(
+                axis=(1, 3)
+            )
+            ax.imshow(displayed, cmap=ListedColormap(["#f1f1f1", "#23679a"]), vmin=0, vmax=1)
+            ax.set_title(f"{res} m: {change_rows[-1]['different_percent']:.1f}% of comparable cells")
+            ax.set_axis_off()
+    axes.flat[-1].set_axis_off()
+    axes.flat[-1].legend(handles=[Patch(color="#23679a", label="Display block includes a changed class")], loc="center")
+    fig.suptitle(
+        "Dominant-area land cover versus nearest source class\nDiagnostic comparison; nearest is not the delivered method"
+    )
+    fig.savefig(report / "land_cover_changes.png", dpi=150)
+    fig.savefig(report / "land_cover_changes.pdf")
+    plt.close(fig)
+    for name, rows in (("land_cover_class_areas", area_rows), ("land_cover_changed_cells", change_rows)):
+        with (report / f"{name}.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def write_collection_readmes(work: Path) -> None:
