@@ -2,6 +2,7 @@
 """Create or validate the portable Fram3S project using an installed PyQGIS runtime."""
 
 import argparse
+import hashlib
 import json
 import os
 import zipfile
@@ -41,9 +42,18 @@ def require_arial() -> None:
         raise RuntimeError("Arial is not installed or cannot be loaded")
 
 
+def vector_source(path: Path, layer_name: str, title: str):
+    """Keep delivery GeoPackages byte-stable, including SQLite header metadata."""
+    options = QgsVectorLayer.LayerOptions()
+    options.forceReadOnly = True
+    layer = QgsVectorLayer(str(path) + "|layername=" + layer_name, title, "ogr", options)
+    layer.setReadOnly(True)
+    return layer
+
+
 def vector(project, group, path, layer_name, title, subset="", color="#216b80", width="0.25", visible=False):
     """Add a styled vector layer without copying the underlying dataset."""
-    layer = QgsVectorLayer(str(path) + "|layername=" + layer_name, title, "ogr")
+    layer = vector_source(path, layer_name, title)
     if not layer.isValid():
         raise RuntimeError(f"Invalid vector layer: {path}, {layer_name}")
     if subset and not layer.setSubsetString(subset):
@@ -132,9 +142,9 @@ def build(root: Path) -> Path:
         rg.setExpanded(False)
     sub_group = tree.addGroup("Avalanche-report subregions")
     # Select North Tyrol by province and positive-area intersection, directly from the GPKG.
-    boundary_layer = QgsVectorLayer(str(root / "aoi.gpkg") + "|layername=boundaries", "boundaries", "ogr")
+    boundary_layer = vector_source(root / "aoi.gpkg", "boundaries", "boundaries")
     north = next(f.geometry() for f in boundary_layer.getFeatures() if f["region"] == "north_tyrol")
-    subregions = QgsVectorLayer(str(root / "aoi.gpkg") + "|layername=subregions", "subregions", "ogr")
+    subregions = vector_source(root / "aoi.gpkg", "subregions", "subregions")
     ids = [
         f["id"]
         for f in subregions.getFeatures()
@@ -200,6 +210,8 @@ def validate(root: Path, records: Path, render: bool) -> dict:
     vector_counts = {}
     for layer in project.mapLayers().values():
         if isinstance(layer, QgsVectorLayer):
+            if not layer.readOnly():
+                raise RuntimeError(f"Vector layer permits writes: {layer.name()}")
             count = 0
             for feature in layer.getFeatures():
                 if not feature.hasGeometry() or feature.geometry().isEmpty():
@@ -251,6 +263,7 @@ def validate(root: Path, records: Path, render: bool) -> dict:
         if not job.renderedImage().save(str(records / "qgis_project_preview.png")):
             raise RuntimeError("QGIS preview failed")
     result = {
+        "vectors_read_only": True,
         "roi_rasters": len(rasters),
         "font": "Arial",
         "outside_roi_transparent": True,
@@ -275,12 +288,16 @@ def main():
     app = QgsApplication([], False)
     app.initQgis()
     require_arial()
+    gpkg = args.root / "aoi.gpkg"
+    original_hash = hashlib.sha256(gpkg.read_bytes()).hexdigest()
     if args.validate_only:
         print(json.dumps(validate(args.root, args.records, True)))
     else:
         print(json.dumps({"project": str(build(args.root)), "next": "Reopen with --validate-only"}))
     QgsProject.instance().clear()
     app.exitQgis()
+    if hashlib.sha256(gpkg.read_bytes()).hexdigest() != original_hash:
+        raise RuntimeError("QGIS changed GeoPackage bytes")
 
 
 if __name__ == "__main__":
