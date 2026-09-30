@@ -49,7 +49,7 @@ The work directory contains source hashes, source-pixel statistics, parent raste
 
 AOI output includes all boundary/buffer/extent geometries, ROI partition Shapefile ZIPs, a 90-feature subregion GeoPackage with original attributes, the map PNG/PDF, the QGIS project, and the machine-readable grid inventory. The QGIS project uses relative paths and references active subregion files, not archived paths.
 
-The work directory's `diagnostics/` contains parent statistics, coverage and terrain maps, and land-cover change summaries. Class areas are compared over the original source rectangle, clipping target edge-cell areas to that footprint. The change map compares delivered dominant-area classes with nearest source classes as a diagnostic baseline; a colored display block contains at least one changed target cell. Its percentages refer to individual comparable target cells.
+The work directory's `diagnostics/` contains parent statistics, coverage and terrain maps, and land-cover change summaries. Class areas are compared over the original source rectangle, clipping target edge-cell areas to that footprint. The change map compares delivered dominant-area classes with nearest source classes as a diagnostic baseline. Every panel shows the fraction of differing target cells within the same 1 km display grid and uses the same color scale. Panel percentages refer to all comparable target cells at that resolution.
 
 The Kathi core mask uses the original North Tyrol boundary on the 100 m grid with a 5 km context envelope: `(578000, 5175000, 784000, 5298000)`, 2060 columns by 1230 rows. It differs intentionally from the buffered region's ROI mask.
 

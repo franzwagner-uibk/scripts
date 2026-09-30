@@ -91,8 +91,6 @@ def raster_diagnostics(work: Path, report: Path) -> dict:
 def land_cover_changes(work: Path, report: Path) -> None:
     """Compare class areas over the source footprint and map aggregation changes."""
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
-    from matplotlib.patches import Patch
     from rasterio.warp import Resampling, reproject
 
     source = json.loads((work / "source_manifest.json").read_text())["lc"]
@@ -143,21 +141,31 @@ def land_cover_changes(work: Path, report: Path) -> None:
                     "different_percent": 100 * float(changed.sum()) / int(valid.sum()),
                 }
             )
-            # Aggregate for display so sparse changes remain visible at all resolutions.
-            stride = max(1, target.width // 500)
+            # Use the same 1 km display cells and fraction scale at every resolution.
+            stride = 1000 // res
             padded_shape = tuple(int(np.ceil(size / stride)) * stride for size in valid.shape)
-            displayed = np.zeros(padded_shape, dtype="uint8")
-            displayed[: target.height, : target.width] = changed
-            displayed = displayed.reshape(padded_shape[0] // stride, stride, padded_shape[1] // stride, stride).max(
-                axis=(1, 3)
-            )
-            ax.imshow(displayed, cmap=ListedColormap(["#f1f1f1", "#23679a"]), vmin=0, vmax=1)
+            counts = []
+            for mask in (changed, valid):
+                displayed = np.zeros(padded_shape, dtype="uint8")
+                displayed[: target.height, : target.width] = mask
+                counts.append(
+                    displayed.reshape(padded_shape[0] // stride, stride, padded_shape[1] // stride, stride).sum(
+                        axis=(1, 3)
+                    )
+                )
+            fraction = np.divide(counts[0], counts[1], out=np.full(counts[0].shape, np.nan), where=counts[1] > 0)
+            image = ax.imshow(fraction, cmap="Blues", vmin=0, vmax=1)
             ax.set_title(f"{res} m: {change_rows[-1]['different_percent']:.1f}% of comparable cells")
             ax.set_axis_off()
     axes.flat[-1].set_axis_off()
-    axes.flat[-1].legend(handles=[Patch(color="#23679a", label="Display block includes a changed class")], loc="center")
+    fig.colorbar(
+        image,
+        cax=axes.flat[-1].inset_axes([0.12, 0.5, 0.76, 0.07]),
+        orientation="horizontal",
+        label="Fraction of target cells differing\nwithin each 1 km display cell",
+    )
     fig.suptitle(
-        "Dominant-area land cover versus nearest source class\nDiagnostic comparison; nearest is not the delivered method"
+        "Dominant-area land cover versus nearest source class\nCommon 1 km display grid and fraction scale"
     )
     fig.savefig(report / "land_cover_changes.png", dpi=150)
     fig.savefig(report / "land_cover_changes.pdf")
