@@ -271,6 +271,8 @@ def plot_overview(output: Path) -> None:
 def validate_vectors(work: Path) -> dict:
     """Verify exported geometry, preserved subregion attributes and region membership."""
     from fram3s_grids.geometry import read_regions
+    from fram3s_grids.common import envelope
+    from shapely.geometry import box
 
     output = work / "output/01-aoi"
     source = work / "sources/vectors"
@@ -281,6 +283,9 @@ def validate_vectors(work: Path) -> dict:
     boundaries = gpd.read_file(output / "aoi_overview.gpkg", layer="boundaries")
     for _, row in boundaries.iterrows():
         expected = regions[row.region].buffer(int(row.buffer_m), quad_segs=64) if row.buffer_m else regions[row.region]
+        rectangle = box(*envelope(expected.bounds))
+        if regions[row.region].difference(expected).area > 0.001:
+            raise ValueError("Buffer does not contain the original region")
         if expected.symmetric_difference(row.geometry).area > 0.001:
             raise ValueError("Exported boundary changed")
         folder = variant_dir(output, row.region, int(row.buffer_m)) / "vectors"
@@ -297,6 +302,8 @@ def validate_vectors(work: Path) -> dict:
                 raise ValueError("Invalid vector partition export")
             if item.loc[item.ROI == 1].geometry.iloc[0].symmetric_difference(expected).area > 0.001:
                 raise ValueError("Shapefile/GPKG ROI differs")
+            if item.geometry.unary_union.symmetric_difference(rectangle).area > 0.001:
+                raise ValueError("Exported partition does not cover its grid rectangle")
         if partition.geometry.iloc[0].intersection(partition.geometry.iloc[1]).area > 0.001:
             raise ValueError("Exported partition overlaps")
     original = (
@@ -397,6 +404,7 @@ def finish_manifest(work: Path) -> None:
         raise ValueError("Expected exactly 75 stacks")
     validate_vectors(work)
     kathi_package(work / "output")
+    validate_kathi_package(work)
     root = work / "output/01-aoi"
     save_json(root / "collection_manifest.json", rows)
     flat = [
@@ -418,3 +426,35 @@ def finish_manifest(work: Path) -> None:
         if p.is_file()
     ]
     save_json(work / "artifact_manifest.json", artifacts)
+
+
+def validate_kathi_package(work: Path) -> None:
+    """Check the self-contained handoff against the already validated regional stack."""
+    folder = work / "output/01-aoi/kathi_north_tyrol_100m"
+    shape, transform = grid((578000, 5175000, 784000, 5298000), 100)
+    core = gpd.read_file(folder / "north_tyrol_core.gpkg", layer="north_tyrol_core").geometry.iloc[0]
+    expected_roi = rasterize([(core, 1)], out_shape=shape, transform=transform, fill=0, dtype="uint8")
+    for kind in ROOTS:
+        expected = (
+            expected_roi
+            if kind == "roi"
+            else read_window(work / "parents/100m" / f"{kind}.tif", (578000, 5175000, 784000, 5298000))
+        )
+        for suffix in ("tif", "asc"):
+            with rasterio.open(folder / "grids" / f"{kind}_north_tyrol_core_100.{suffix}") as src:
+                values = src.read(1)
+                if src.shape != shape or src.transform != transform or src.crs.to_epsg() != 25832:
+                    raise ValueError(f"Kathi geometry mismatch: {kind}.{suffix}")
+                if not np.allclose(values, expected, rtol=1e-7, atol=1e-6):
+                    raise ValueError(f"Kathi grid values differ: {kind}.{suffix}")
+                if kind != "roi" and ((values == NODATA) | ~np.isfinite(values))[expected_roi == 1].any():
+                    raise ValueError(f"Kathi ROI has missing {kind} values")
+    partition = gpd.read_file("zip://" + str(folder / "north_tyrol_core.zip"))
+    if set(partition.ROI) != {0, 1} or not partition.geometry.is_valid.all():
+        raise ValueError("Invalid Kathi Shapefile partition")
+    if partition.loc[partition.ROI == 1].geometry.iloc[0].symmetric_difference(core).area > 0.001:
+        raise ValueError("Kathi Shapefile differs from original North Tyrol")
+    save_json(
+        folder / "validation.json",
+        {"layers": 5, "columns": shape[1], "rows": shape[0], "core_roi_cells": int(expected_roi.sum()), "failures": []},
+    )
