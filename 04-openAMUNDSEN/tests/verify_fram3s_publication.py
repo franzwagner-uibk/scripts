@@ -1,6 +1,7 @@
 """Exercise Windows publication on disposable files, including failures before archival."""
 
 import hashlib
+import ctypes
 import json
 import os
 import subprocess
@@ -117,4 +118,8 @@ def check_publication(root):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="fram3s-publication-test-") as temporary:
-        print(json.dumps(check_publication(Path(temporary))))
+        # Exercise the 8.3 paths used by GitHub's Windows runner when available.
+        short_path = ctypes.create_unicode_buffer(32768)
+        if not ctypes.windll.kernel32.GetShortPathNameW(temporary, short_path, len(short_path)):
+            raise ctypes.WinError()
+        print(json.dumps(check_publication(Path(short_path.value))))

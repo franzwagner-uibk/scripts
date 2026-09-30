@@ -8,6 +8,10 @@ param(
     [switch]$Publish
 )
 $ErrorActionPreference = 'Stop'
+# Enumeration expands Windows 8.3 aliases. Normalize roots before building paths
+# so relative archive suffixes and collision checks use the same representation.
+$WorkRoot = (Get-Item -LiteralPath $WorkRoot).FullName
+$DestinationRoot = (Get-Item -LiteralPath $DestinationRoot).FullName
 $OutputRoot = Join-Path $WorkRoot 'output'
 $Aoi = Join-Path $OutputRoot '01-aoi'
 $Manifest = Get-Content -LiteralPath (Join-Path $WorkRoot 'artifact_manifest.json') -Raw | ConvertFrom-Json
