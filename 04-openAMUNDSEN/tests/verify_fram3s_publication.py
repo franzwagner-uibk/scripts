@@ -86,7 +86,9 @@ def check_publication(root):
     assert not list(dest.rglob("archive"))
     (work / "artifact_manifest.json").write_text(json.dumps(manifest))
 
-    subprocess.run(args + ["-Publish"], check=True, capture_output=True)
+    published = subprocess.run(args + ["-Publish"], capture_output=True)
+    if published.returncode:
+        raise RuntimeError(published.stdout.decode(errors="replace") + published.stderr.decode(errors="replace"))
     journal = json.loads(next(report.glob("publication_*.json")).read_text(encoding="utf-8-sig"))
     assert journal["status"] == "complete" and journal["published_files"] == len(manifest)
     assert len(journal["archived_files"]) == 4
