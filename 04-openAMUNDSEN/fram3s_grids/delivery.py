@@ -181,6 +181,7 @@ def plot_overview(output: Path) -> None:
     root = output / "01-aoi"
     shapes = gpd.read_file(root / "aoi.gpkg", layer="boundaries")
     extents = gpd.read_file(root / "aoi.gpkg", layer="grid_extents")
+    subregions = gpd.read_file(root / "aoi.gpkg", layer="subregions")
     fig = plt.figure(figsize=(17, 12), layout="constrained")
     gs = fig.add_gridspec(2, 6)
     axes = [fig.add_subplot(gs[0, i : i + 2]) for i in (0, 2, 4)]
@@ -195,6 +196,11 @@ def plot_overview(output: Path) -> None:
     colors = {0: "#177e89", 5000: "#e79532", 10000: "#b04a82"}
     for ax, (name, title) in zip(axes, labels.items()):
         shapes[shapes.region == name].plot(ax=ax, color="#c5dee1", edgecolor="#216b80", linewidth=0.7)
+        core = shapes.loc[shapes.region == name].geometry.iloc[0]
+        clipped = subregions.geometry.intersection(core)
+        clipped[~clipped.is_empty & (clipped.area > 0)].boundary.plot(
+            ax=ax, color="#4e5559", linewidth=0.35, alpha=0.75
+        )
         for buffer_m in (10000, 5000, 0):
             extents[
                 (extents.region == name) & (extents.buffer_m == buffer_m) & (extents.resolution_m == 100)

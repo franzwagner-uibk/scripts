@@ -64,7 +64,7 @@ Windows QGIS requires native Windows staging for GeoPackages; SQLite locking thr
 python buildFram3sGrids.py finalize --work /work
 ```
 
-Finalization requires exactly 1145 whitelisted files and successful QGIS evidence, validates the vectors and core-cell invariance, then hashes the final artifacts. JSONs, CSV inventories, source manifests, diagnostics, previews and logs remain outside `output/`. The overview contains five region panels showing original ROIs and context rectangles.
+Finalization requires exactly 1145 whitelisted files and successful QGIS evidence, validates the vectors and core-cell invariance, then hashes the final artifacts. JSONs, CSV inventories, source manifests, diagnostics, previews and logs remain outside `output/`. The overview contains five region panels showing original ROIs, internal subregion boundaries and context rectangles. Subregion outlines are clipped to each original region and have no legend entry.
 
 ## Publication and rollback
 
