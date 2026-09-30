@@ -22,7 +22,7 @@ Implements colleague's method (Hanzer et al., 2016) with elevation dependency:
     srf[>=1] = 1 + (srf-1) * elev_factor
     srf[< 1] = 1 - (1 - srf) * elev_factor
 
-Optionally (disabled by default) normalize SRF so mean = 1.0.
+Normalize SRF so mean = 1.0 (enabled by default).
 
 Author: Franz Wagner
 Date: 2025-10-02
@@ -37,12 +37,14 @@ DEM_PATH: str = r"F:\fram3s\01-data\06-dem\dem_euregio_1000.asc"
 # =========================
 # IMPORTS
 # =========================
+import argparse
 import logging
 import time
 from pathlib import Path
 import sys
 
 import numpy as np
+import numba
 import rasterio
 from rasterio.transform import Affine
 
@@ -69,37 +71,22 @@ USE_PROGRESS_BAR: bool = True
 # Logging
 LOG_LEVEL: int = logging.INFO
 LOG_FORMAT: str = "%(asctime)s - %(levelname)s - %(message)s"
-# Optional: also write logs to a file next to this script
-LOG_TO_FILE: bool = True
-LOG_FILE_PATH: Path = Path(__file__).with_suffix(".log")
+# Optional file logging is selected explicitly with --log-file.
 
 
 # =================
 # LOGGING SETUP
 # =================
-handler = logging.StreamHandler(stream=sys.stdout)
-handler.setLevel(LOG_LEVEL)
-handler.setFormatter(logging.Formatter(LOG_FORMAT))
-handlers = [handler]
-if LOG_TO_FILE:
-    try:
-        LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(LOG_FILE_PATH, mode="a", encoding="utf-8")
-        file_handler.setLevel(LOG_LEVEL)
-        file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-        handlers.append(file_handler)
-    except Exception as exc:  # pragma: no cover
-        # Fall back to console-only logging if file handler fails
-        print(f"WARNING: Could not set up file logging ({exc}); continuing with console logging only.")
-
-logging.basicConfig(
-    handlers=handlers,
-    level=LOG_LEVEL,
-    format=LOG_FORMAT,
-    force=True,  # ensure our config is applied even if another lib configured logging earlier
-)
 logger = logging.getLogger(__name__)
-logger.setLevel(LOG_LEVEL)
+
+
+def configure_logging(log_file: Path | None = None) -> None:
+    """Configure CLI logging without writing files when imported as a library."""
+    handlers = [logging.StreamHandler(stream=sys.stdout)]
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
+    logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, handlers=handlers, force=True)
 
 
 # =================
@@ -191,7 +178,14 @@ def compute_openness_negative(dem: np.ndarray, resolution_m: int, radius_m: int)
     dem_ma = np.ma.masked_invalid(dem)
     dem_filled = dem_ma.filled(np.nan).astype(float)
     # oa.terrain.openness handles negative=True (negative openness)
-    no = oa.terrain.openness(dem_filled, resolution_m, radius_m, negative=True)
+    # Upstream openness updates a shared minimum array inside prange. Serial
+    # execution preserves the formula and avoids nondeterministic lost minima.
+    previous_threads = numba.get_num_threads()
+    try:
+        numba.set_num_threads(1)
+        no = oa.terrain.openness(dem_filled, resolution_m, radius_m, negative=True)
+    finally:
+        numba.set_num_threads(previous_threads)
     # Re-apply mask where DEM invalid
     no = np.ma.masked_array(no.astype(np.float32), mask=np.ma.getmaskarray(dem_ma))
     logger.info("Openness done: radius=%d m (%.2f s)", radius_m, time.perf_counter() - t0)
@@ -297,13 +291,19 @@ def compute_srf(dem: np.ndarray, resolution_m: float, progress: "StepProgress | 
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dem", type=Path, default=Path(DEM_PATH))
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--log-file", type=Path)
+    args = parser.parse_args()
+    configure_logging(args.log_file)
     logger.info("=== SRF computation (openness + elevation dependency) started ===")
     if LOG_TO_FILE:
         logger.info("Log file: %s", LOG_FILE_PATH.resolve())
     progress = StepProgress(total_steps=6, enabled=USE_PROGRESS_BAR)
     try:
         # 1) Load DEM from user-defined path at top of script
-        dem_path = DEM_PATH
+        dem_path = args.dem
         if not dem_path:
             raise ValueError("DEM_PATH is empty. Please set DEM_PATH at the top of the script.")
 
@@ -339,7 +339,9 @@ def main() -> None:
             out_stem = f"srf_{stem.removeprefix('dem_')}"
         else:
             out_stem = f"srf_{stem}"
-        output_srf_asc = dem_path_obj.with_name(f"{out_stem}.asc")
+        output_srf_asc = args.output or dem_path_obj.with_name(f"{out_stem}.asc")
+        if output_srf_asc.exists():
+            raise FileExistsError(output_srf_asc)
 
         # 2) SRF computation
         srf = compute_srf(dem, resolution, progress=progress)
