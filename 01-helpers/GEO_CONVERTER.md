@@ -77,3 +77,33 @@ python -m pytest -q 01-helpers/tests/test_geo_converter.py
 Synthetic tests cover holes, disconnected pieces, exact raster round trips,
 missing or conflicting raster CRS, invalid raster classes, province selection,
 5 km padding, overwrite protection and the original GPKG-to-SHP conversion.
+
+## Polygon buffers for the current Fram3S collection
+
+```console
+python 01-helpers/geoConverter.py --mode boundarybuffers --aoi-root F:/fram3s/01-data/01-aoi
+```
+
+This mode reads the `boundaries` layer of `aoi.gpkg` for Euregio, Tyrol, North
+Tyrol, South Tyrol and Trentino. It does not process Ötztal or depend on the old
+province-source paths. The input must be valid polygon geometry in EPSG:25832.
+
+Each region is expanded outward by 5,000 and 10,000 meters using round joins
+with 64 segments per quadrant. The output includes the original region and its
+surrounding buffer. It follows the polygon outline; it is not a rectangle or an
+exterior-only ring. Buffers are not clipped to the existing raster extents.
+
+The ten outputs are ordinary shapefiles with projection/encoding sidecars, named:
+
+```text
+<region>/buffer_05000m/<region>_polygon_buffer_05000m.shp
+<region>/buffer_10000m/<region>_polygon_buffer_10000m.shp
+```
+
+Each file has one polygon or multipart polygon feature with `region` and integer
+`buffer_m` attributes. Existing ROI partitions, grids and the central GeoPackage
+are preserved. All targets must be absent, and the region/buffer directories
+must already exist. All ten exports are staged and checked before delivery;
+each delivered file is reopened to verify CRS, attributes, validity, source
+containment and equality with its intended buffer geometry. Sidecar checksums
+are checked after copying. Existing output files are never overwritten.

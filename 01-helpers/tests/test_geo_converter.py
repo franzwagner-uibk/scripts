@@ -112,3 +112,56 @@ def test_original_gpkg_to_shp_conversion(tmp_path):
     result = gpd.read_file(tmp_path / "shapes/original.shp")
     assert result.value.tolist() == [7]
     assert result.crs.to_epsg() == 25832
+
+
+def boundary_collection(root, crs=25832):
+    regions = ["euregio", "tyrol", "north_tyrol", "south_tyrol", "trentino"]
+    polygon = box(600000, 5200000, 601000, 5201000)
+    gpd.GeoDataFrame({"region": regions}, geometry=[polygon] * len(regions), crs=crs).to_file(
+        root / "aoi.gpkg", layer="boundaries", driver="GPKG")
+    for region in regions:
+        for distance in (5000, 10000):
+            (root / region / f"buffer_{distance:05d}m").mkdir(parents=True)
+    return polygon
+
+
+def test_polygon_buffers_follow_outline_and_reject_overwrite(tmp_path):
+    from shapely.geometry import Point
+
+    original = boundary_collection(tmp_path)
+    source_hash = converter._sha256(tmp_path / "aoi.gpkg")
+    reports = converter.export_boundary_buffers(tmp_path)
+    assert len(reports) == 10
+    for report in reports:
+        frame = gpd.read_file(report["path"])
+        geometry = frame.geometry.iloc[0]
+        distance = report["buffer_m"]
+        assert geometry.covers(original)
+        assert geometry.area > original.area
+        assert not geometry.equals(geometry.envelope)
+        assert geometry.covers(Point(601000 + distance - 0.01, 5200500))
+        assert not geometry.covers(Point(601000 + distance + 0.01, 5200500))
+        assert not geometry.covers(Point(601000 + distance, 5201000 + distance))
+        assert np.issubdtype(frame.buffer_m.dtype, np.integer)
+    assert converter._sha256(tmp_path / "aoi.gpkg") == source_hash
+    digests = {path: converter._sha256(path) for path in tmp_path.rglob("*.shp")}
+    with pytest.raises(ValueError, match="already exists"):
+        converter.export_boundary_buffers(tmp_path)
+    assert all(converter._sha256(path) == digest for path, digest in digests.items())
+
+
+def test_polygon_buffers_preflight_entire_batch(tmp_path):
+    boundary_collection(tmp_path)
+    conflict = tmp_path / "trentino/buffer_10000m/trentino_polygon_buffer_10000m.dbf"
+    conflict.write_bytes(b"existing sidecar")
+    with pytest.raises(ValueError, match="already exists"):
+        converter.export_boundary_buffers(tmp_path)
+    assert not list(tmp_path.rglob("*.shp"))
+    assert conflict.read_bytes() == b"existing sidecar"
+
+
+def test_polygon_buffers_reject_geographic_source(tmp_path):
+    boundary_collection(tmp_path, crs=4326)
+    with pytest.raises(ValueError, match="EPSG:25832"):
+        converter.export_boundary_buffers(tmp_path)
+    assert not list(tmp_path.rglob("*.shp"))

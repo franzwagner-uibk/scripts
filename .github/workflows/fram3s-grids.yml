@@ -1,0 +1,56 @@
+name: Fram3S grid processing tests
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fram3s-grids.yml
+      - 04-openAMUNDSEN/fram3s_grids/**
+      - 04-openAMUNDSEN/buildFram3sGrids.py
+      - 04-openAMUNDSEN/calculateSRF.py
+      - 04-openAMUNDSEN/qgisFram3sProject.py
+      - 04-openAMUNDSEN/FRAM3S_GRIDS.md
+      - 04-openAMUNDSEN/tests/test_fram3s_grids.py
+      - 04-openAMUNDSEN/tests/verify_fram3s_publication.py
+      - 04-openAMUNDSEN/publishFram3sGrids.ps1
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fram3s-grids.yml
+      - 04-openAMUNDSEN/fram3s_grids/**
+      - 04-openAMUNDSEN/buildFram3sGrids.py
+      - 04-openAMUNDSEN/calculateSRF.py
+      - 04-openAMUNDSEN/qgisFram3sProject.py
+      - 04-openAMUNDSEN/tests/test_fram3s_grids.py
+      - 04-openAMUNDSEN/tests/verify_fram3s_publication.py
+      - 04-openAMUNDSEN/publishFram3sGrids.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  numerical-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test numerical and file contracts
+        run: |
+          docker run --rm --network none --read-only \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            -e OPENBLAS_NUM_THREADS=1 -e NUMBA_NUM_THREADS=2 \
+            -e NUMBA_CACHE_DIR=/tmp/numba \
+            -v "${GITHUB_WORKSPACE}:/repo:ro" -w /repo/04-openAMUNDSEN \
+            --entrypoint /opt/conda/envs/openamundsen_da/bin/python \
+            ghcr.io/openamundsen/openamundsen-da@sha256:f3834a701e116b9ab11c50677d94236bffcd5d9adb045ae6b871b3ccf2c98723 \
+            -m pytest -q -p no:cacheprovider tests/test_fram3s_grids.py
+
+  windows-publication:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify archive, publication and failure behavior on disposable files
+        run: python 04-openAMUNDSEN/tests/verify_fram3s_publication.py
