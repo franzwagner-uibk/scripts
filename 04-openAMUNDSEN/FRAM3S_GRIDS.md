@@ -108,3 +108,21 @@ whitelist and do not change the grids, ROI masks, central GeoPackage or QGIS
 project. Generate them after base finalization/publication, and regenerate them
 after a clean republication if needed. See `01-helpers/GEO_CONVERTER.md` for
 names, attributes, validation and overwrite protection.
+
+Add the supplemental shapefiles to the existing QGIS project without rebuilding
+its original layer tree (use the installed QGIS Python environment):
+
+```console
+python qgisFram3sProject.py --root F:/fram3s/01-data/01-aoi --records <external-records> --add-polygon-buffers
+python qgisFram3sProject.py --root F:/fram3s/01-data/01-aoi --records <external-records> --validate-only
+```
+
+The update backs up the original project in the records directory and adds a
+`Polygon boundary buffers` group with one subgroup per region. Each contains a
+5 km green solid outline and a 10 km orange dashed outline with transparent
+interiors. New layers start unchecked; existing layers and their visibility
+remain intact. All ten sources are relative and read-only. Repeated updates do
+not duplicate the layers. The augmented project has 110 layers, including the
+original 75 ROI rasters, and reopening validates all ten buffer features.
+The base project builder still builds the base collection; rerun this update
+after rebuilding it to restore the supplemental layer group.

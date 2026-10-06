@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -67,6 +69,93 @@ def vector(project, group, path, layer_name, title, subset="", color="#216b80", 
     node = group.addLayer(layer)
     node.setItemVisibilityChecked(visible)
     return layer
+
+
+BUFFER_PROPERTY = "fram3s/polygon_buffer"
+BUFFER_LABELS = {
+    "euregio": "Euregio",
+    "tyrol": "Tyrol (including East Tyrol)",
+    "north_tyrol": "North Tyrol",
+    "south_tyrol": "South Tyrol",
+    "trentino": "Trentino",
+}
+
+
+def add_polygon_buffer_layers(project: QgsProject, root: Path) -> int:
+    """Add the ten supplemental outlines once, preserving existing layer state."""
+    existing = {str(layer.customProperty(BUFFER_PROPERTY)): layer
+                for layer in project.mapLayers().values() if layer.customProperty(BUFFER_PROPERTY)}
+    pending = []
+    for region, title in BUFFER_LABELS.items():
+        for distance in (5000, 10000):
+            key = f"{region}:{distance}"
+            if key in existing:
+                continue
+            path = root / region / f"buffer_{distance:05d}m" / f"{region}_polygon_buffer_{distance:05d}m.shp"
+            options = QgsVectorLayer.LayerOptions()
+            options.forceReadOnly = True
+            layer = QgsVectorLayer(str(path), f"{title} — {distance // 1000} km polygon buffer", "ogr", options)
+            layer.setReadOnly(True)
+            if not layer.isValid() or layer.featureCount() != 1 or layer.crs().authid() != "EPSG:25832":
+                raise RuntimeError(f"Invalid polygon buffer: {path}")
+            feature = next(layer.getFeatures())
+            if feature["region"] != region or feature["buffer_m"] != distance:
+                raise RuntimeError(f"Incorrect polygon buffer attributes: {path}")
+            if feature.geometry().isEmpty() or not feature.geometry().isGeosValid():
+                raise RuntimeError(f"Invalid polygon buffer geometry: {path}")
+            layer.setCustomProperty(BUFFER_PROPERTY, key)
+            layer.renderer().setSymbol(QgsFillSymbol.createSimple({
+                "style": "no", "outline_color": "#1b9e77" if distance == 5000 else "#d95f02",
+                "outline_style": "solid" if distance == 5000 else "dash", "outline_width": "0.4",
+                "joinstyle": "round",
+            }))
+            pending.append((title, layer))
+    # Load and check all providers before adding anything to the existing tree.
+    tree = project.layerTreeRoot()
+    group = tree.findGroup("Polygon boundary buffers")
+    if pending and group is None:
+        group = tree.insertGroup(1, "Polygon boundary buffers")
+    for title, layer in pending:
+        region_group = group.findGroup(title)
+        if region_group is None:
+            region_group = group.addGroup(title)
+            region_group.setExpanded(False)
+        project.addMapLayer(layer, False)
+        region_group.addLayer(layer).setItemVisibilityChecked(False)
+    return len(pending)
+
+
+def update_polygon_buffers(root: Path, records: Path) -> dict:
+    """Back up and update an existing project without resetting its original layers."""
+    project = QgsProject.instance()
+    project.clear()
+    target = root / "aoi_overview.qgz"
+    if not project.read(str(target)):
+        raise RuntimeError(f"Cannot open QGIS project: {target}")
+    original_ids = set(project.mapLayers())
+    original_visibility = {node.layerId(): node.itemVisibilityChecked() for node in project.layerTreeRoot().findLayers()}
+    added = add_polygon_buffer_layers(project, root)
+    if add_polygon_buffer_layers(project, root) != 0:
+        raise RuntimeError("Repeated buffer integration added duplicate layers")
+    if not original_ids.issubset(project.mapLayers()):
+        raise RuntimeError("Existing QGIS layer removed")
+    for layer_id, checked in original_visibility.items():
+        if project.layerTreeRoot().findLayer(layer_id).itemVisibilityChecked() != checked:
+            raise RuntimeError("Existing layer visibility changed")
+    records.mkdir(parents=True, exist_ok=True)
+    backup = records / f"aoi_overview_before_buffers_{uuid.uuid4().hex}.qgz"
+    shutil.copy2(target, backup)
+    project.setFilePathStorage(Qgis.FilePathType.Relative)
+    # Stage beside the destination so serialized relative paths stay correct.
+    staged = root / f".aoi_overview_buffers_{uuid.uuid4().hex}.qgz"
+    try:
+        if not project.write(str(staged)):
+            raise RuntimeError("QGIS buffer project write failed")
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
+    return {"project": str(target), "added_polygon_buffers": added,
+            "layers": len(project.mapLayers()), "backup": str(backup)}
 
 
 def build(root: Path) -> Path:
@@ -222,6 +311,19 @@ def validate(root: Path, records: Path, render: bool) -> dict:
             if count != layer.featureCount() or count == 0:
                 raise RuntimeError(f"Unreadable/empty features in {layer.name()}: {count}")
             vector_counts[layer.id()] = count
+    polygon_buffers = [layer for layer in project.mapLayers().values() if layer.customProperty(BUFFER_PROPERTY)]
+    if polygon_buffers:
+        expected = {f"{region}:{distance}" for region in BUFFER_LABELS for distance in (5000, 10000)}
+        if len(polygon_buffers) != 10 or {str(layer.customProperty(BUFFER_PROPERTY)) for layer in polygon_buffers} != expected:
+            raise RuntimeError("Missing or duplicate polygon buffer layers")
+        for layer in polygon_buffers:
+            if layer.crs().authid() != "EPSG:25832" or layer.featureCount() != 1:
+                raise RuntimeError(f"Invalid polygon buffer: {layer.name()}")
+            feature = next(layer.getFeatures())
+            if f"{feature['region']}:{feature['buffer_m']}" != layer.customProperty(BUFFER_PROPERTY):
+                raise RuntimeError(f"Incorrect polygon buffer attributes: {layer.name()}")
+            if not feature.geometry().isGeosValid():
+                raise RuntimeError(f"Invalid polygon buffer geometry: {layer.name()}")
     layers = [node.layer() for node in project.layerTreeRoot().findLayers() if node.isVisible()]
     records.mkdir(parents=True, exist_ok=True)
     rasters = [layer for layer in project.mapLayers().values() if isinstance(layer, QgsRasterLayer)]
@@ -271,6 +373,7 @@ def validate(root: Path, records: Path, render: bool) -> dict:
             raise RuntimeError("QGIS preview failed")
     result = {
         "vectors_read_only": True,
+        "polygon_buffer_layers": len(polygon_buffers),
         "roi_rasters": len(rasters),
         "font": "Arial",
         "outside_roi_transparent": True,
@@ -290,14 +393,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--records", type=Path, required=True, help="Validation directory outside delivery")
-    parser.add_argument("--validate-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--validate-only", action="store_true")
+    mode.add_argument("--add-polygon-buffers", action="store_true", help="Update existing project with 5/10 km outlines")
     args = parser.parse_args()
     app = QgsApplication([], False)
     app.initQgis()
     require_arial()
     gpkg = args.root / "aoi.gpkg"
     original_hash = hashlib.sha256(gpkg.read_bytes()).hexdigest()
-    if args.validate_only:
+    if args.add_polygon_buffers:
+        print(json.dumps(update_polygon_buffers(args.root, args.records)))
+    elif args.validate_only:
         print(json.dumps(validate(args.root, args.records, True)))
     else:
         print(json.dumps({"project": str(build(args.root)), "next": "Reopen with --validate-only"}))
