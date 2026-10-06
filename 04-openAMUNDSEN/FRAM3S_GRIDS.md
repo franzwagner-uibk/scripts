@@ -11,7 +11,7 @@ The builder produces 75 stacks: five regions, three terrain buffers and five res
 - **ROI always represents the original region.** Cell centers inside are 1, outside are valid 0, NoData is 255. Terrain buffer variants have identical geographic core cells at each resolution.
 - DEM, land-cover, SRF and SVF NoData is −9999. Continuous values keep their fractional precision.
 
-There are exactly **1145 files** under the five active layer roots:
+The base grid collection contains exactly **1145 files** under the five active layer roots:
 
 - 1125 GeoTIFF, ASCII and `.prj` files: five layers × 75 stacks × three files.
 - 15 Shapefile ZIPs under `01-aoi/<region>/buffer_<buffer>m/`.
@@ -91,3 +91,20 @@ python tests/verify_fram3s_publication.py
 ```
 
 The second command requires Windows. Numerical tests cover alignment, area aggregation, categorical ties, NoData, source edges, core-cell invariance, independent ASCII metadata, the delivery whitelist and SRF reproducibility. The Windows fixture covers dry runs, changed input/terrain rejection, unexpected-file rejection, raw-source archival, unchanged terrain and all 1145 final hashes, including Windows 8.3 paths. GitHub Actions runs both jobs. Production validation additionally checks every full raster export and all detailed vector partitions.
+
+## Supplemental polygon buffers
+
+After publishing the base collection, export actual 5 and 10 km polygon buffers:
+
+```console
+python 01-helpers/geoConverter.py --mode boundarybuffers --aoi-root F:/fram3s/01-data/01-aoi
+```
+
+This reads the five current `aoi.gpkg` boundaries and writes ten ordinary
+shapefiles (50 files including sidecars) into their existing region/buffer
+folders. Each polygon includes the original region and the outward buffer.
+These optional supplements are separate from the 1145-file base publication
+whitelist and do not change the grids, ROI masks, central GeoPackage or QGIS
+project. Generate them after base finalization/publication, and regenerate them
+after a clean republication if needed. See `01-helpers/GEO_CONVERTER.md` for
+names, attributes, validation and overwrite protection.

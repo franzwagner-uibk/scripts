@@ -7,6 +7,7 @@ Simple batch and single-file converter for:
   - Shapefile (.shp) <-> GeoPackage (.gpkg)
   - Shapefile (.shp) / GeoPackage (.gpkg) -> GeoJSON (.geojson)
   - North Tyrol / Oetztal ROI -> validated two-feature zipped shapefile
+  - Fram3S region outlines -> 5 and 10 km buffered polygon shapefiles
 
 The original conversions use the CONFIG section below. Run both saved ROI
 jobs with ``python geoConverter.py --mode roi2shp``; see GEO_CONVERTER.md.
@@ -41,6 +42,7 @@ import geopandas as gpd
 #   "shp2json"  - convert Shapefile  -> GeoJSON
 #   "gpkg2json" - convert GeoPackage -> GeoJSON
 #   "roi2shp"   - build saved North Tyrol / Oetztal ROI ZIPs
+#   "boundarybuffers" - export 5 and 10 km polygon buffers from aoi.gpkg
 MODE: str = "shp2gpkg"
 
 # Input can be a single file or a directory.
@@ -438,18 +440,88 @@ def run_roi_jobs(job: str = "all", output_dir: Optional[Path] = None) -> list:
     return reports
 
 
+def export_boundary_buffers(aoi_root: Path) -> list:
+    """Export filled 5/10 km buffers for the five current Fram3S region polygons."""
+    from shapely import force_2d
+
+    source = aoi_root / "aoi.gpkg"
+    source_hash = _sha256(source)
+    boundaries = gpd.read_file(source, layer="boundaries")
+    regions = {"euregio", "tyrol", "north_tyrol", "south_tyrol", "trentino"}
+    _require(boundaries.crs is not None and boundaries.crs.to_epsg() == 25832,
+             "Boundary buffers require source EPSG:25832 (meters)")
+    _require(set(boundaries.region) == regions and len(boundaries) == len(regions),
+             "Expected one boundary for each of the five Fram3S regions")
+    extensions = (".shp", ".shx", ".dbf", ".prj", ".cpg")
+    jobs = []
+    for row in boundaries.itertuples():
+        original = force_2d(row.geometry)
+        _require(original.geom_type in {"Polygon", "MultiPolygon"}
+                 and original.is_valid and not original.is_empty, f"Invalid boundary: {row.region}")
+        for distance in (5000, 10000):
+            folder = aoi_root / row.region / f"buffer_{distance:05d}m"
+            stem = f"{row.region}_polygon_buffer_{distance:05d}m"
+            _require(folder.is_dir(), f"Destination directory missing: {folder}")
+            _require(not list(folder.glob(stem + ".*")), f"Buffer output already exists: {folder / stem}")
+            buffered = original.buffer(distance, quad_segs=64, join_style="round")
+            _require(buffered.is_valid and buffered.covers(original) and buffered.area > original.area,
+                     f"Invalid expanded boundary: {row.region}, {distance}")
+            jobs.append((row.region, distance, original, buffered, folder, stem))
+
+    def validate(path: Path, region: str, distance: int, original: object, expected: object) -> dict:
+        frame = gpd.read_file(path)
+        _require(len(frame) == 1 and frame.crs.to_epsg() == 25832, f"Invalid buffer schema or CRS: {path}")
+        _require(set(frame.columns) == {"region", "buffer_m", "geometry"}
+                 and frame.region.iloc[0] == region and frame.buffer_m.iloc[0] == distance,
+                 f"Invalid buffer attributes: {path}")
+        actual = frame.geometry.iloc[0]
+        _require(actual.is_valid and not actual.has_z and actual.covers(original), f"Invalid buffer geometry: {path}")
+        _require(actual.equals(expected), f"Export changed buffer geometry: {path}")
+        return {"region": region, "buffer_m": distance, "path": str(path), "epsg": 25832,
+                "features": 1, "area_km2": actual.area / 1e6}
+
+    reports = []
+    with tempfile.TemporaryDirectory(prefix="geoconverter_boundary_buffers_") as directory:
+        work = Path(directory)
+        # Prepare and validate the complete batch before delivering any files.
+        for region, distance, original, buffered, folder, stem in jobs:
+            frame = gpd.GeoDataFrame({"region": [region], "buffer_m": [distance]},
+                                     geometry=[buffered], crs=25832)
+            frame.to_file(work / (stem + ".shp"), driver="ESRI Shapefile", encoding="UTF-8", index=False)
+            for extension in extensions:
+                _require((work / (stem + extension)).is_file(), f"Missing sidecar: {stem + extension}")
+            validate(work / (stem + ".shp"), region, distance, original, buffered)
+        _require(_sha256(source) == source_hash, "Source GeoPackage changed during buffer preparation")
+        for region, distance, original, buffered, folder, stem in jobs:
+            for extension in extensions:
+                staged, target = work / (stem + extension), folder / (stem + extension)
+                with staged.open("rb") as src, target.open("xb") as dst:
+                    shutil.copyfileobj(src, dst)
+                _require(_sha256(staged) == _sha256(target), f"Delivery checksum mismatch: {target}")
+            reports.append(validate(folder / (stem + ".shp"), region, distance, original, buffered))
+    return reports
+
+
 # =================
 # MAIN ORCHESTRATION
 # =================
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["shp2gpkg", "gpkg2shp", "shp2json", "gpkg2json", "roi2shp"],
+    parser.add_argument("--mode", choices=["shp2gpkg", "gpkg2shp", "shp2json", "gpkg2json", "roi2shp", "boundarybuffers"],
                         default=MODE.lower())
     parser.add_argument("--roi-job", choices=["all", "north_tyrol", "oetztal"], default="all")
     parser.add_argument("--roi-output-dir", type=Path, help="Existing directory for fresh ROI ZIPs")
+    parser.add_argument("--aoi-root", type=Path, default=ROI_BASE, help="AOI root containing aoi.gpkg")
     args = parser.parse_args()
     configure_logging(LOG_LEVEL)
     mode = args.mode
+    if mode == "boundarybuffers":
+        try:
+            print(json.dumps(export_boundary_buffers(args.aoi_root), indent=2, ensure_ascii=False))
+        except Exception as exc:
+            logging.error("Boundary buffer export failed: %s", exc)
+            raise SystemExit(1) from exc
+        return
     if mode == "roi2shp":
         try:
             print(json.dumps(run_roi_jobs(args.roi_job, args.roi_output_dir), indent=2, ensure_ascii=False))
